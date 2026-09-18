@@ -5,6 +5,7 @@ magisk/system/priv-app/Gateway/
 !magisk/system/priv-app/PermissionController/
 local.properties
 .env.build
+.env.build.ps1
 
 # Gradle
 .gradle/

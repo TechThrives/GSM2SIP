@@ -1181,7 +1181,7 @@ class GatewayService : Service() {
             serverDomain = cfgServer,
             serverPort = cfgPort,
             localIp = localIp,
-            localPort = 5060,
+            localPort = cfgPort,
             publicIp = publicIp,
             useTls = useTls,
             srtpRequested = prefs.getBoolean("srtp_enabled", false)
