@@ -92,6 +92,7 @@ class SmsReceiver : BroadcastReceiver() {
             @Suppress("MissingPermission")
             val info = sm.getActiveSubscriptionInfo(subId) ?: return Triple(-1, "", "")
             val number = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                @Suppress("DEPRECATION")
                 runCatching { info.number }.getOrDefault("")
             } else {
                 @Suppress("DEPRECATION")

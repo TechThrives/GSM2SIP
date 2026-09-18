@@ -83,6 +83,7 @@ object GsmCallManager {
     fun onCallAdded(call: Call, service: InCallService) {
         inCallService = service
         activeCall = call
+        @Suppress("DEPRECATION")
         activeCallState = call.state
         lastDisconnectCause = null
         // Release the previous call's object; the dedupe only needs to span
@@ -91,6 +92,7 @@ object GsmCallManager {
 
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
 
+        @Suppress("DEPRECATION")
         when (call.state) {
             Call.STATE_RINGING -> {
                 Log.i(TAG, "Incoming GSM call from $number")
@@ -379,6 +381,7 @@ object GsmCallManager {
                 // kills VOICE_CALL capture (confirmed v2.8.33).
 
                 if (profile.requireSpeakerMode) {
+                    @Suppress("DEPRECATION")
                     service.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
                 }
 
@@ -506,6 +509,7 @@ object GsmCallManager {
         Thread({ batchMixerRestore() }, "MixerRestore").start()
         try {
             inCallService?.let { service ->
+                @Suppress("DEPRECATION")
                 service.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
 
                 val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager

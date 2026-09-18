@@ -1495,7 +1495,7 @@ class GatewayService : Service() {
         }
 
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "gateway:wifi").apply {
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "gateway:wifi").apply {
             acquire()
         }
         Log.i(TAG, "Wake + WiFi locks acquired")

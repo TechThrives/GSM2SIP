@@ -2,6 +2,7 @@ package com.callagent.gateway
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -20,6 +21,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.net.Uri
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.app.role.RoleManager
 import android.net.ConnectivityManager
@@ -52,6 +54,9 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.PopupMenu
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -65,6 +70,43 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
+
+    private fun currentWifiInfo(): WifiInfo? {
+        val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val network = cm.activeNetwork
+            val caps = cm.getNetworkCapabilities(network)
+            caps?.transportInfo as? WifiInfo
+        } else {
+            @Suppress("DEPRECATION")
+            wm.connectionInfo
+        }
+    }
+
+    private val backCallback = object : OnBackPressedCallback(true) {
+        override fun handleOnBackPressed() {
+            if (inCallOpen) {
+                return
+            } else if (currentTab == "logs") {
+                switchTab("config")
+            } else if (currentTab != "home") {
+                switchTab("home")
+            } else {
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+            }
+        }
+    }
+
+    private val dialerRoleLauncher: ActivityResultLauncher<Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                appendLog("Set as default phone app")
+            } else {
+                appendLog("WARN: Not set as default phone app — GSM call handling disabled")
+            }
+        }
 
     // Settings-tab views
     private lateinit var tvLog: TextView
@@ -315,6 +357,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        onBackPressedDispatcher.addCallback(this, backCallback)
         // Portrait lock, enforced at runtime as well as in the manifest.
         // A priv-app APK replaced in place is not always re-parsed by
         // PackageManager, so the manifest's screenOrientation can silently
@@ -869,31 +912,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvNetWifi.text = try {
-            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
             val cm = getSystemService(ConnectivityManager::class.java)
             val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
             val onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-            @Suppress("DEPRECATION")
-            val info = wm.connectionInfo
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+            val info = currentWifiInfo()
             when {
                 !wm.isWifiEnabled -> "WiFi off"
-                // networkId is NOT a connectivity test: without location
-                // permission getConnectionInfo() comes back redacted with
-                // networkId = -1 even on a healthy connection, which is what
-                // made this read "WiFi off" while WiFi was up.  Connectivity
-                // comes from NetworkCapabilities; link metrics are not
-                // location-gated and are still readable here.
                 !onWifi -> "WiFi not connected"
                 else -> {
-                    @Suppress("DEPRECATION")
                     val raw = info?.ssid?.trim('"').orEmpty()
                     val ssid =
                         if (raw.isEmpty() || raw.contains("unknown", true)) "WiFi" else raw
-                    @Suppress("DEPRECATION")
                     val freq = info?.frequency ?: 0
-                    @Suppress("DEPRECATION")
                     val speed = info?.linkSpeed ?: -1
-                    @Suppress("DEPRECATION")
                     val rssi = info?.rssi ?: 0
                     val band = if (freq > 4000) "5G" else "2.4G"
                     if (speed > 0) "$ssid $band ${speed}Mbps ${rssi}dBm"
@@ -1093,29 +1125,21 @@ class MainActivity : AppCompatActivity() {
             val wm = applicationContext.getSystemService(WIFI_SERVICE)
                 as android.net.wifi.WifiManager
             appendLine("Enabled      : ${if (wm.isWifiEnabled) "yes" else "no"}")
-            @Suppress("DEPRECATION")
-            val info = wm.connectionInfo
-            // Real SSID/BSSID: these read "<unknown ssid>" / 02:00:00:00:00:00
-            // without location, which the Magisk module now grants on boot.
-            @Suppress("DEPRECATION")
+            val info = currentWifiInfo()
             val ssidRaw = info?.ssid?.trim('"').orEmpty()
             appendLine(
                 "SSID         : " +
                     if (ssidRaw.isEmpty() || ssidRaw.contains("unknown", true)) "—" else ssidRaw
             )
-            @Suppress("DEPRECATION")
             val bssid = info?.bssid.orEmpty()
             appendLine(
                 "BSSID (AP)   : " +
                     if (bssid.isEmpty() || bssid.startsWith("02:00:00")) "—" else bssid
             )
             appendLine("Security     : ${wifiSecurityName(info)}")
-            @Suppress("DEPRECATION")
             val freq = info?.frequency ?: 0
-            @Suppress("DEPRECATION")
             appendLine("Link speed   : ${info?.linkSpeed ?: -1} Mbps")
             appendLine("Frequency    : $freq MHz (${if (freq > 4000) "5 GHz" else "2.4 GHz"})")
-            @Suppress("DEPRECATION")
             appendLine("RSSI         : ${info?.rssi ?: 0} dBm")
 
             // IP and DNS come from LinkProperties: no root, no permission, and
@@ -1355,18 +1379,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    @Suppress("DEPRECATION")
-    override fun onBackPressed() {
-        if (inCallOpen) {
-            return // must use END CALL
-        } else if (currentTab == "logs") {
-            switchTab("config")
-        } else if (currentTab != "home") {
-            switchTab("home")
-        } else {
-            super.onBackPressed()
-        }
-    }
+    // Back navigation handled by backCallback in onCreate
 
     override fun onResume() {
         super.onResume()
@@ -1674,6 +1687,7 @@ class MainActivity : AppCompatActivity() {
         TelephonyManager.NETWORK_TYPE_EDGE,
         TelephonyManager.NETWORK_TYPE_CDMA,
         TelephonyManager.NETWORK_TYPE_1xRTT,
+        @Suppress("DEPRECATION")
         TelephonyManager.NETWORK_TYPE_IDEN -> "2G"
         TelephonyManager.NETWORK_TYPE_UMTS,
         TelephonyManager.NETWORK_TYPE_EVDO_0,
@@ -1907,14 +1921,14 @@ class MainActivity : AppCompatActivity() {
             if (rm.isRoleAvailable(RoleManager.ROLE_DIALER) &&
                 !rm.isRoleHeld(RoleManager.ROLE_DIALER)
             ) {
-                startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_DIALER), REQ_DEFAULT_DIALER)
+                dialerRoleLauncher.launch(rm.createRequestRoleIntent(RoleManager.ROLE_DIALER))
             }
         } else {
             @Suppress("DEPRECATION")
             val intent = Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).apply {
                 putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName)
             }
-            startActivityForResult(intent, REQ_DEFAULT_DIALER)
+            dialerRoleLauncher.launch(intent)
         }
     }
 
@@ -1925,18 +1939,6 @@ class MainActivity : AppCompatActivity() {
                 data = Uri.parse("package:$packageName")
             }
             startActivity(intent)
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_DEFAULT_DIALER) {
-            if (resultCode == RESULT_OK) {
-                appendLog("Set as default phone app")
-            } else {
-                appendLog("WARN: Not set as default phone app — GSM call handling disabled")
-            }
         }
     }
 
@@ -1954,7 +1956,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_PERMS = 100
-        private const val REQ_DEFAULT_DIALER = 101
         private const val MAX_CALL_LOG = 20
     }
 }

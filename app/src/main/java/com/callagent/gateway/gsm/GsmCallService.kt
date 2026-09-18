@@ -17,6 +17,7 @@ class GsmCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+        @Suppress("DEPRECATION")
         val state = call.state
         Log.i(TAG, "Call added: number=$number state=$state")
 
