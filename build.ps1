@@ -124,12 +124,23 @@ function Build-Apk {
 
     if ($BuildType -eq "release") {
         & $gradlew assembleRelease --no-daemon
+        # Native exit codes bypass $ErrorActionPreference, and the Test-Path
+        # below would happily pass on the previous build's APK.
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Gradle failed (exit code $LASTEXITCODE) - see output above. Not packaging a possibly-stale APK."
+            exit 1
+        }
         $apkPath = Join-Path $ScriptDir "app\build\outputs\apk\release\app-release.apk"
         if (-not (Test-Path $apkPath)) {
             $apkPath = Join-Path $ScriptDir "app\build\outputs\apk\release\app-release-unsigned.apk"
         }
     } else {
         & $gradlew assembleDebug --no-daemon
+        # Same guard as the release branch above.
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Gradle failed (exit code $LASTEXITCODE) - see output above. Not packaging a possibly-stale APK."
+            exit 1
+        }
         $apkPath = Join-Path $ScriptDir "app\build\outputs\apk\debug\app-debug.apk"
     }
 

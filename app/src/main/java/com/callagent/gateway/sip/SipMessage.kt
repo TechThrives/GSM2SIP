@@ -183,12 +183,11 @@ class SipMessage private constructor(
 
     /** Serialize this message back to a SIP packet string */
     fun encode(): String {
-        val sb = StringBuilder()
-        sb.append(startLine).append("\r\n")
-        for ((_, value) in headers) {
-            // headers stored lowercase key, but we need proper casing — use raw lines
-        }
-        // We store raw header lines for serialization
+        // We store raw header lines for serialization, so the parsed form is
+        // echoed back verbatim when there is one.  The `sb`/no-op-loop block
+        // that used to sit here built a StringBuilder and threw it away —
+        // it appended nothing (the loop body was empty) and the return below
+        // never consulted it.
         return raw ?: buildString {
             append(startLine).append("\r\n")
             headers.forEach { (k, v) ->

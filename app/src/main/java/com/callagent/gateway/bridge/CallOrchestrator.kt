@@ -2,13 +2,14 @@ package com.callagent.gateway.bridge
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.os.Build
 import android.telecom.Call
 import android.telecom.DisconnectCause
+import android.telecom.TelecomManager
 import android.telephony.PhoneNumberUtils
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
+import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.rtp.RtpPacket
@@ -49,23 +50,54 @@ class CallOrchestrator(
     private val sipClient: SipClient
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
 
-    private var activeRtpSession: RtpSession? = null
-    private var activeSipCall: SipCall? = null
-    private var activeGsmCall: Call? = null
+    // Every field below is written from the Telecom callback (main thread),
+    // the SIP receive thread (onRtpReady / onCallTerminated) and the spawned
+    // SIP-OutCall / RTP-Start threads, and read from all of them plus
+    // setAgentMuted / setMonitorEnabled.  The generation counter protects
+    // *ordering* — a stale timer must not tear down a newer call — but it
+    // says nothing about *visibility*: without a fence there is no guarantee
+    // a write on one thread is ever observed by another, and the JVM is free
+    // to keep these in a register or a CPU cache indefinitely.  That is the
+    // shape of the logged "GSM active but no pending RTP info" case, where
+    // the value was set moments earlier by a different thread.
+    @Volatile private var activeRtpSession: RtpSession? = null
+    @Volatile private var activeSipCall: SipCall? = null
+    @Volatile private var activeGsmCall: Call? = null
     @Volatile private var diallerInitiated = false
     @Volatile private var lastStateChangeTime = 0L
 
     // Pending RTP info: saved when SIP answers before GSM is picked up.
     // onGsmCallActive reads these to start RTP immediately after GSM pickup.
-    private var pendingRtpAddr: String? = null
-    private var pendingRtpPort: Int = 0
-    private var pendingPayloadType: Int = 0
-    private var pendingLocalRtpPort: Int = 0
+    // Written by the SIP receive thread, read by the Telecom callback.
+    @Volatile private var pendingRtpAddr: String? = null
+    @Volatile private var pendingRtpPort: Int = 0
+    @Volatile private var pendingPayloadType: Int = 0
+    @Volatile private var pendingLocalRtpPort: Int = 0
 
     // SIP call retry: if SIP fails while GSM is ringing, retry before giving up.
     // Transient network issues or socket races can kill the first attempt.
-    private var sipCallRetries = 0
+    // Read and written from SIP-received and timer threads alike.
+    @Volatile private var sipCallRetries = 0
     private val MAX_SIP_RETRIES = 2
+
+    /**
+     * Start a fresh SIP-retry allowance for a new call attempt.
+     *
+     * [sipCallRetries] used to be zeroed only in [onIncomingGsmCall], but the
+     * counter gates [onCallTerminated]'s retry path, which is also reachable
+     * from the dialler-initiated flow — and that flow never passes through
+     * onIncomingGsmCall.  Once an earlier inbound call had burned through
+     * MAX_SIP_RETRIES, every later dialler call started with the counter
+     * already exhausted and got zero retries on its first SIP failure, until
+     * the process restarted.  Called from each place a call attempt begins,
+     * plus the teardown paths so no attempt can inherit another's allowance.
+     */
+    private fun resetSipRetries(reason: String) {
+        if (sipCallRetries != 0) {
+            Log.d(TAG, "Resetting SIP retry counter ($sipCallRetries → 0) for $reason")
+        }
+        sipCallRetries = 0
+    }
 
     /** One thread for every deferred bridge action, instead of a fresh Thread
      *  per dial, per INVITE and per retry. */
@@ -141,24 +173,200 @@ class CallOrchestrator(
      * back, the orchestrator rejects it as busy, and the GSM leg is never
      * answered.
      *
+     * [subId] identifies the SIM that actually took the call.  On a dual-SIM
+     * gateway the default subscription is the wrong question to ask: a call
+     * arriving on the non-default SIM would be announced as the default SIM's
+     * DID and routed to the wrong assistant.  Passing the subscription in
+     * mirrors what [com.callagent.gateway.service.GatewayService] already does
+     * for SMS via ownNumberForSub().  When the caller cannot say which SIM it
+     * was, the default subscription is the fallback, as before.
+     *
      * Asks the platform first; many carriers do not publish the number on the
      * SIM, in which case the configured value is used.
      */
-    private fun inboundSipDestination(): String {
-        simNumber()?.let {
+    private fun inboundSipDestination(subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID): String {
+        simNumber(subId)?.let {
             val intl = toInternational(it)
-            Log.i(TAG, "Own number from SIM: $it → $intl")
+            Log.i(TAG, "Own number from SIM (sub=$subId): $it → $intl")
             return intl
         }
-        val configured = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
-            .getString("own_number", DEFAULT_OWN_NUMBER)?.trim().orEmpty()
+        val configured = configuredOwnNumber(subId)
         if (configured.isNotEmpty()) {
             val intl = toInternational(configured)
-            Log.i(TAG, "Own number from settings: $configured → $intl")
+            Log.i(TAG, "Own number from settings (sub=$subId): $configured → $intl")
             return intl
         }
-        Log.w(TAG, "No own number known — addressing our own extension, which loops back")
+        Log.w(
+            TAG,
+            "No own number known (sub=$subId: SIM silent and slot box empty) — " +
+                "addressing our own extension, which loops back"
+        )
         return sipClient.username
+    }
+
+    /**
+     * The SIM's number for one subscription, falling back to the default.
+     *
+     * Thin enough to look like it does nothing, and kept only because this is
+     * the name the call flow already reads as.  The body lives in OwnNumber
+     * with the SMS path's copy of it, so the two can never pick different
+     * numbers for the same SIM; that file also carries why the pre-Android 13
+     * branch has to be scoped to [subId] instead of left on the default
+     * subscription.
+     */
+    private fun simNumber(subId: Int): String? = OwnNumber.fromSim(context, subId)
+
+    /**
+     * The configured MSISDN for one subscription.
+     *
+     * Same slot-keyed lookup the SMS path uses: resolve the subscription to a
+     * SIM slot and read `own_number_slot_<slot>`, which is the key Settings
+     * writes per SIM.  This returns empty rather than falling back to another
+     * slot's box — see OwnNumber for why a cross-slot fallback is the silent
+     * wrong-DID bug, and note that inboundSipDestination() already reports an
+     * empty result before it settles on the SIP account.
+     */
+    @SuppressLint("MissingPermission")
+    private fun configuredOwnNumber(subId: Int): String {
+        val prefs = gatewayPrefs(context)
+        // No SIM to name, or a slot we cannot resolve: nothing to look up, so
+        // say so downstream instead of guessing which SIM was meant.
+        if (!isValidSubscription(subId)) return ""
+        val slot = runCatching {
+            context.getSystemService(SubscriptionManager::class.java)
+                ?.getActiveSubscriptionInfo(subId)?.simSlotIndex
+        }.getOrNull() ?: return ""
+        return prefs.getString("own_number_slot_$slot", "")?.trim().orEmpty()
+    }
+
+    private fun isValidSubscription(subId: Int): Boolean =
+        subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID &&
+            SubscriptionManager.isValidSubscriptionId(subId)
+
+    /**
+     * Which SIM a Telecom [Call] belongs to, or the invalid id when unknown.
+     *
+     * This is the one step in the whole lookup that is genuinely build
+     * specific, so it is resolved several ways before giving up.  AOSP
+     * registers one PhoneAccount per subscription and names it after the
+     * subscription id; other builds have named the same account after the
+     * ICCID, after a compound string, or after nothing parseable at all.
+     * Getting this wrong is not a lost nicety — it collapses the entire
+     * multi-SIM path onto the default subscription, which is precisely the
+     * silent wrong-DID failure every other part of this file exists to
+     * prevent.
+     *
+     * Every branch logs which strategy won, because for a handset nobody has
+     * in front of them the only way to learn how it names its accounts is to
+     * read one line of its log.  The branches are ordered and additive: a
+     * handle AOSP would have parsed is still parsed first, so an unfamiliar
+     * device can end up no worse off than it is today, only ever better.
+     *
+     * Returns [SubscriptionManager.INVALID_SUBSCRIPTION_ID] when nothing
+     * matched, which is the pre-existing "ask for the default subscription"
+     * behaviour.
+     */
+    private fun subscriptionIdFor(call: Call): Int {
+        val handle = try {
+            call.details?.accountHandle
+        } catch (e: Exception) {
+            Log.w(TAG, "PhoneAccountHandle unavailable: ${e.message}")
+            null
+        }
+        if (handle == null) return SubscriptionManager.INVALID_SUBSCRIPTION_ID
+        val handleId = handle.id?.trim().orEmpty()
+
+        // 1. AOSP: the id *is* the subscription id, written as a decimal.
+        handleId.toIntOrNull()?.takeIf { isValidSubscription(it) }?.let {
+            // Logged on the success path deliberately: "no log line appeared"
+            // is a much weaker claim to check than a line showing the raw
+            // handle and the id it parsed to.
+            Log.i(TAG, "Call account handle '$handleId' → subscription $it")
+            return it
+        }
+
+        val active = runCatching {
+            context.getSystemService(SubscriptionManager::class.java)
+                ?.activeSubscriptionInfoList
+        }.getOrNull().orEmpty()
+
+        // 2. A build that names the account after its ICCID.  A subscription
+        //    id is a small int, so an 18-22 digit run can only be a card
+        //    identifier and can never have been caught by step 1; comparing
+        //    digits on both sides tolerates separators and the formatting
+        //    platforms add around the number.
+        val digits = handleId.filter { it.isDigit() }
+        if (digits.length in 18..22) {
+            active.firstOrNull { info ->
+                info.iccId?.filter { c -> c.isDigit() } == digits
+            }?.let {
+                Log.i(
+                    TAG,
+                    "Call account handle '$handleId' matched ICCID → " +
+                        "subscription ${it.subscriptionId} (slot ${it.simSlotIndex})"
+                )
+                return it.subscriptionId
+            }
+        } else if (digits.isNotEmpty()) {
+            // 3. A compound id such as "2:voice".  Deliberately not attempted
+            //    on ICCID-shaped ids, because every run of digits inside one
+            //    would qualify here and step 2 is the branch that owns them.
+            //    Membership of the live subscription list is required rather
+            //    than merely a well-formed number, so a stray component of
+            //    some other string cannot be mistaken for a SIM.
+            active.firstOrNull { it.subscriptionId.toString() == digits }?.let {
+                Log.i(
+                    TAG,
+                    "Call account handle '$handleId' → " +
+                        "subscription ${it.subscriptionId} (compound id)"
+                )
+                return it.subscriptionId
+            }
+        }
+
+        // 4. Whatever the account happens to be called, some builds publish
+        //    its MSISDN as the PhoneAccount address.  Matching that against
+        //    the numbers already resolved per subscription identifies the SIM
+        //    without ever learning what the id meant — so this branch runs
+        //    even when the id held no digits at all.  The length floor is
+        //    there because a short component of an unrelated URI must not be
+        //    allowed to match.
+        val addressed = runCatching {
+            context.getSystemService(TelecomManager::class.java)
+                ?.getPhoneAccount(handle)?.address?.toString()
+        }.getOrNull()?.filter { it.isDigit() }.orEmpty()
+        if (addressed.length >= 8) {
+            active.firstOrNull { info ->
+                val subId = info.subscriptionId
+                listOfNotNull(
+                    OwnNumber.fromSim(context, subId),
+                    gatewayPrefs(context)
+                        .getString("own_number_slot_${info.simSlotIndex}", "")
+                ).any { configured ->
+                    val own = digitsOf(configured)
+                    own == addressed || own.endsWith(addressed) || addressed.endsWith(own)
+                }
+            }?.let {
+                Log.i(
+                    TAG,
+                    "Call account '$handleId' resolved by its address → " +
+                        "subscription ${it.subscriptionId} (slot ${it.simSlotIndex})"
+                )
+                return it.subscriptionId
+            }
+        }
+
+        // Deliberately not Log.d: this is the case where the whole multi-SIM
+        // path is silently inert, and debug-level lines are the first thing a
+        // default filter drops.  Saying how many SIMs were visible and what
+        // the handle actually contained is what makes an untested handset
+        // diagnosable from a single line.
+        Log.w(
+            TAG,
+            "Call account '$handleId' matched no strategy " +
+                "(${active.size} active SIMs) — using default SIM"
+        )
+        return SubscriptionManager.INVALID_SUBSCRIPTION_ID
     }
 
     /**
@@ -189,21 +397,10 @@ class CallOrchestrator(
         return trimmed
     }
 
-    /** The SIM's own number, when the carrier publishes it — many do not. */
+    /** The SIM's own number for the default subscription, when the carrier
+     *  publishes it — many do not. */
     @SuppressLint("MissingPermission")
-    private fun simNumber(): String? = try {
-        val number = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.getSystemService(SubscriptionManager::class.java)
-                ?.getPhoneNumber(SubscriptionManager.getDefaultSubscriptionId())
-        } else {
-            @Suppress("DEPRECATION")
-            (context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager).line1Number
-        }
-        number?.trim()?.ifEmpty { null }
-    } catch (e: Exception) {
-        Log.w(TAG, "SIM number unavailable: ${e.message}")
-        null
-    }
+    private fun simNumber(): String? = simNumber(SubscriptionManager.INVALID_SUBSCRIPTION_ID)
 
     /** Cut the agent's audio to the caller, leaving the call itself up. */
     fun setAgentMuted(on: Boolean) {
@@ -257,6 +454,11 @@ class CallOrchestrator(
             }
         }
         Log.i(TAG, "Dialler-initiated call to $number")
+        // The dialler path reaches onCallTerminated without ever passing
+        // through onIncomingGsmCall, so it has to reset the counter itself —
+        // otherwise a previous inbound call that used up its retries leaves
+        // this one with none.
+        resetSipRetries("dialler call to $number")
         diallerInitiated = true
         lastStateChangeTime = System.currentTimeMillis()
         bridgeState = BridgeState.GSM_DIALING
@@ -337,7 +539,12 @@ class CallOrchestrator(
             ?.trim()?.ifEmpty { null } ?: return null
 
         if (user.equals(sipClient.username, ignoreCase = true)) return null
-        if (digitsOf(user) == digitsOf(inboundSipDestination())) return null
+        // Compare against every own number the gateway can answer on, not
+        // just the default SIM's: on a dual-SIM gateway the server routes
+        // each DID back to this same peer, and a Request-URI carrying the
+        // non-default SIM's MSISDN would otherwise pass this check and be
+        // dialled — ringing the gateway's own second SIM.
+        if (isOwnNumber(user)) return null
         if (!looksDialable(user)) return null
 
         Log.i(TAG, "No X-GSM-Forward — destination taken from the Request-URI")
@@ -354,6 +561,59 @@ class CallOrchestrator(
             digitsOf(user).length >= MIN_DIALABLE_DIGITS
 
     private fun digitsOf(value: String): String = value.filter { it.isDigit() }
+
+    /**
+     * Is this Request-URI user one of our own MSISDNs?
+     *
+     * The loop guard in [outboundDestination].  It has to cover both SIMs
+     * plus the configured fallbacks, because the server cannot tell this
+     * gateway's two DIDs apart from any other number it might forward.
+     */
+    @SuppressLint("MissingPermission")
+    private fun isOwnNumber(user: String): Boolean {
+        val digits = digitsOf(user)
+        if (digits.isEmpty()) return false
+
+        // Every active subscription's published number.
+        try {
+            val sm = context.getSystemService(SubscriptionManager::class.java)
+            for (info in sm?.activeSubscriptionInfoList ?: emptyList()) {
+                val subId = info.subscriptionId
+                // Prefer the number the platform reports for the
+                // subscription, then the configured per-slot value — the
+                // same two-step lookup inboundSipDestination() uses.  Both
+                // halves now come from OwnNumber, so the guard recognises
+                // exactly the numbers routing would have chosen, and the
+                // pre-Android 13 branch here can no longer disagree with it.
+                val candidates = mutableListOf<String?>(
+                    OwnNumber.fromSim(context, subId),
+                    gatewayPrefs(context).getString("own_number_slot_${info.simSlotIndex}", "")
+                )
+                if (candidates.any { it != null && digitsOf(it) == digits }) return true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "own-number enumeration failed: ${e.message}")
+        }
+
+        // Legacy single-key config, and the default SIM as a last resort.
+        val prefs = gatewayPrefs(context)
+        // listOfNotNull() has already dropped the nulls, so `it` is non-null
+        // inside the lambda; an explicit `it != null` there reads as dead
+        // logic and the compiler reports it as such.
+        listOfNotNull(
+            prefs.getString("own_number", null),
+            runCatching { simNumber(subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID) }
+                .getOrNull()
+        ).forEach { if (digitsOf(it) == digits) return true }
+
+        return false
+    }
+
+    /** The gateway's settings.  Called [gatewayPrefs] rather than
+     *  getSharedPreferences() so a call site doesn't read as a call to the
+     *  two-arg [Context] method this wraps. */
+    private fun gatewayPrefs(context: Context) =
+        context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
 
     /** Handles termination from both SipClient.Listener and SipCall.Listener */
     override fun onCallTerminated(call: SipCall) {
@@ -394,7 +654,7 @@ class CallOrchestrator(
             return
         }
 
-        sipCallRetries = 0
+        resetSipRetries("incoming GSM call")
         bridgeState = BridgeState.GSM_RINGING
         activeGsmCall = call
         listener?.onStateChanged(bridgeState, "GSM call from $number")
@@ -595,9 +855,13 @@ class CallOrchestrator(
             listener?.onStateChanged(bridgeState, "Bridged (inbound)")
             Log.i(TAG, "Bridge established (codec=$codecName)")
         } else {
+            // Neither a bridge setup nor an answerable state — there is
+            // nothing established here, and the old "Inbound bridge
+            // established — GSM was already active" line that used to follow
+            // this logged a success this branch cannot produce.  It was
+            // left over from a refactor and never reflected reality.
             Log.w(TAG, "onRtpReady ignored — bridgeState=$bridgeState (expected SIP_CALLING or SIP_RINGING)")
             listener?.onError("RTP ready but bridge state wrong: $bridgeState")
-            Log.i(TAG, "Inbound bridge established — GSM was already active (codec=$codecName)")
         }
     }
 
@@ -605,14 +869,17 @@ class CallOrchestrator(
 
     private fun handleInboundFlow(gsmCall: Call) {
         val callerNumber = gsmCall.details?.handle?.schemeSpecificPart ?: "unknown"
-        Log.i(TAG, "Inbound flow: placing SIP call for GSM caller $callerNumber")
+        // The SIM that is actually ringing decides the DID we announce, not
+        // whichever SIM the platform happens to call default.
+        val subId = subscriptionIdFor(gsmCall)
+        Log.i(TAG, "Inbound flow: placing SIP call for GSM caller $callerNumber (sub=$subId)")
 
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
 
         val rtpPort = allocateRtpPort()
         val sipCall = sipClient.makeCall(
-            targetExtension = inboundSipDestination(),
+            targetExtension = inboundSipDestination(subId),
             localRtpPort = rtpPort,
             callerIdNumber = callerNumber,
             callerIdName = callerNumber
@@ -636,6 +903,7 @@ class CallOrchestrator(
     private fun handleOutboundFlow(sipCall: SipCall, gsmDestination: String) {
         Log.i(TAG, "Outbound flow: dialing GSM $gsmDestination")
 
+        resetSipRetries("outbound call to $gsmDestination")
         bridgeState = BridgeState.GSM_DIALING
         activeSipCall = sipCall
         listener?.onStateChanged(bridgeState, "Dialing $gsmDestination")
@@ -770,6 +1038,9 @@ class CallOrchestrator(
             bridgeState = BridgeState.IDLE
             generation++
             lastStateChangeTime = System.currentTimeMillis()
+            // A completed call must not leave its retry count behind for the
+            // next one — the counter is per-attempt state, not per-process.
+            resetSipRetries("tearDown ($reason)")
             listener?.onStateChanged(BridgeState.IDLE, reason)
             Log.i(TAG, "Bridge torn down: $reason")
         }
@@ -798,6 +1069,9 @@ class CallOrchestrator(
                     return port
                 }
             } catch (_: Exception) {
+                // Expected and uninteresting: this port is in use, or the
+                // bind was refused.  Tried span/2 more before giving up, so
+                // a line here would only ever repeat the same thing.
                 continue
             }
         }
@@ -819,7 +1093,9 @@ class CallOrchestrator(
     private fun forceAllowRecordAudio() {
         try {
             val pkg = context.packageName
-            val uidProbe = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+            // minSdk 31 >= API 29, so --uid is unconditional: appops set it
+            // per-package before Android 10, per-uid after.
+            val uidProbe = "--uid "
             // This sits directly between the call being answered and the first
             // frame of audio, so ask before acting: one `appops get` costs a
             // single root round-trip, where the grant sequence below is eight
@@ -837,19 +1113,19 @@ class CallOrchestrator(
             val t0 = System.currentTimeMillis()
             // Capture all output (2>&1) for diagnosis.  appops get is LAST
             // so exit code reflects verification, not a stray killall.
-            val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
-            val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+            // minSdk 31 >= API 30, so the auto-revoke opt-out always applies.
+            val autoRevoke =
+                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; "
             val result = RootShell.execForOutput(
                 "killall com.google.android.permissioncontroller 2>/dev/null; " +
                 "killall com.android.permissioncontroller 2>/dev/null; " +
                 "pm grant $pkg android.permission.RECORD_AUDIO 2>&1; " +
                 autoRevoke +
-                "appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
+                "appops set ${uidProbe}$pkg RECORD_AUDIO allow 2>&1; " +
                 "appops set $pkg RECORD_AUDIO allow 2>&1; " +
                 "killall com.google.android.permissioncontroller 2>/dev/null; " +
                 "killall com.android.permissioncontroller 2>/dev/null; " +
-                "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
+                "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             val elapsed = System.currentTimeMillis() - t0
             val allowed = result.contains("allow", ignoreCase = true)
@@ -857,9 +1133,9 @@ class CallOrchestrator(
 
             if (!allowed) {
                 val fb = RootShell.execForOutput(
-                    "cmd appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
+                    "cmd appops set ${uidProbe}$pkg RECORD_AUDIO allow 2>&1; " +
                     "cmd appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
+                    "cmd appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
                 )
                 Log.w(TAG, "appops fallback cmd: [$fb]")
             } else {
@@ -877,24 +1153,31 @@ class CallOrchestrator(
         Log.w(TAG, "Force-resetting bridge: $reason")
         try {
             activeRtpSession?.stop()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "forceReset: error stopping RTP session: ${e.message}")
+        }
         activeRtpSession = null
         try {
             activeSipCall?.let {
                 if (it.state != SipCall.State.TERMINATED) it.hangup()
                 sipClient.removeCall(it.callId)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "forceReset: error ending SIP call: ${e.message}")
+        }
         activeSipCall = null
         try {
             activeGsmCall?.disconnect()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "forceReset: error disconnecting GSM call: ${e.message}")
+        }
         activeGsmCall = null
         pendingRtpAddr = null
         diallerInitiated = false
         bridgeState = BridgeState.IDLE
         generation++
         lastStateChangeTime = System.currentTimeMillis()
+        resetSipRetries("forceReset ($reason)")
         listener?.onStateChanged(BridgeState.IDLE, reason)
         Log.i(TAG, "Bridge force-reset complete: $reason")
     }
@@ -908,9 +1191,6 @@ class CallOrchestrator(
 
         private const val RTP_PORT_MIN = 30000
         private const val RTP_PORT_MAX = 40000
-
-        /** Placeholder shown in settings until a real MSISDN is entered. */
-        private const val DEFAULT_OWN_NUMBER = "+49123123123123"
 
         /** Shortest Request-URI user we will believe is a number to dial. */
         private const val MIN_DIALABLE_DIGITS = 3

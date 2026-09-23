@@ -13,16 +13,9 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
-import android.media.AudioFormat
-import android.media.AudioManager
 import android.widget.SeekBar
-import android.media.AudioRecord
-import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.net.Uri
 import android.net.wifi.WifiInfo
-import android.net.wifi.WifiManager
 import android.app.role.RoleManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -39,9 +32,7 @@ import android.telephony.CellInfoNr
 import android.telephony.CellInfoWcdma
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
-import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -72,16 +63,16 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
 
     private fun currentWifiInfo(): WifiInfo? {
-        val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val cm = getSystemService(ConnectivityManager::class.java)
-            val network = cm.activeNetwork
-            val caps = cm.getNetworkCapabilities(network)
-            caps?.transportInfo as? WifiInfo
-        } else {
-            @Suppress("DEPRECATION")
-            wm.connectionInfo
-        }
+        // minSdk 31 >= API 31, so getTransportInfo() is the only path — and it
+        // is the correct one: WifiManager.getConnectionInfo() below it was
+        // deprecated in Android 12 and had been returning "<unknown ssid>"
+        // without location for years.  Dropping that branch also drops the
+        // WifiManager lookup it needed; ConnectivityManager owns Wi-Fi state
+        // on 12+ anyway.
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val network = cm.activeNetwork
+        val caps = cm.getNetworkCapabilities(network)
+        return caps?.transportInfo as? WifiInfo
     }
 
     private val backCallback = object : OnBackPressedCallback(true) {
@@ -517,6 +508,38 @@ class MainActivity : AppCompatActivity() {
         if (slot < 0) "own_number" else "own_number_slot_$slot"
 
     /**
+     * Our number, for the two labels that show it: "Connected to …" on the
+     * live-call card, and the From/To pair in the SMS detail sheet.
+     *
+     * Neither caller knows which SIM it is looking at — CallLogEntry does not
+     * record a slot, and the live-call card does not ask the orchestrator
+     * which destination it actually dialled — so this can only name the
+     * **default** subscription: exact on a single SIM, an honest
+     * approximation on two.  It is a label and never a routing decision,
+     * which is why naming a SIM here is acceptable in a way it is not in
+     * CallOrchestrator, where guessing silently addresses the wrong DID.
+     *
+     * `own_number` is the legacy single key, read only when the default SIM's
+     * per-slot box and the SIM itself are both empty.  This build writes
+     * `own_number_slot_<slot>` instead and never deletes the legacy key, so it
+     * is present only where a previous install left it.
+     */
+    @SuppressLint("MissingPermission")
+    private fun ownNumberForDisplay(): String {
+        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        val slot = runCatching {
+            getSystemService(SubscriptionManager::class.java)
+                ?.getActiveSubscriptionInfo(SubscriptionManager.getDefaultSubscriptionId())
+                ?.simSlotIndex
+        }.getOrNull()
+        val fromBox = slot?.let { prefs.getString(ownNumberKey(it), "") }?.trim().orEmpty()
+        val fromSim = OwnNumber.fromSim(this, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+        return (fromSim ?: fromBox).ifEmpty {
+            prefs.getString("own_number", "")?.trim().orEmpty()
+        }
+    }
+
+    /**
      * The SIMs that are actually live, in slot order.
      *
      * Slots the hardware has but which hold no SIM are deliberately absent:
@@ -675,7 +698,14 @@ class MainActivity : AppCompatActivity() {
      * the gateway keeps of what it has handled.
      */
     private fun confirmClearRecents() {
-        val count = try { CallLogStore.getEntries(this).size } catch (_: Exception) { 0 }
+        val count = try {
+            CallLogStore.getEntries(this).size
+        } catch (e: Exception) {
+            // Was silent: a read failure looked exactly like an empty list
+            // ("Nothing to clear") when the list might not be empty at all.
+            android.util.Log.w("MainActivity", "Could not count recents: ${e.message}")
+            0
+        }
         if (count == 0) {
             Toast.makeText(this, "Nothing to clear", Toast.LENGTH_SHORT).show()
             return
@@ -687,10 +717,22 @@ class MainActivity : AppCompatActivity() {
                 // Off the UI thread: clearing rewrites the stored blob, and
                 // the list is rebuilt from disk straight afterwards.
                 Thread {
-                    try { CallLogStore.clear(this) } catch (_: Exception) {}
+                    val cleared = try {
+                        CallLogStore.clear(this)
+                        true
+                    } catch (e: Exception) {
+                        // Was silent: the toast below claimed "Recents
+                        // cleared" even when the write failed outright.
+                        android.util.Log.w("MainActivity", "Could not clear recents: ${e.message}")
+                        false
+                    }
                     runOnUiThread {
-                        if (currentTab == "home") refreshHome()
-                        Toast.makeText(this, "Recents cleared", Toast.LENGTH_SHORT).show()
+                        if (cleared) {
+                            if (currentTab == "home") refreshHome()
+                            Toast.makeText(this, "Recents cleared", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(this, "Could not clear recents", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }.start()
             }
@@ -729,7 +771,11 @@ class MainActivity : AppCompatActivity() {
             .putInt("port", port)
             .putString("user", user)
             .putString("pass", pass)
-            .putString("own_number", own)
+            // Writes `own_number_slot_<slot>` per field; when no SIM is
+            // readable the single field sits at slot -1, ownNumberKey(-1) is
+            // `own_number`, and that device keeps its one key.  `own` is never
+            // mirrored into `own_number` — routing reads the per-slot keys
+            // only (see OwnNumber).
             .also { ed ->
                 ownNumberFields.forEach { (slot, et) ->
                     ed.putString(ownNumberKey(slot), et.text.toString().trim())
@@ -818,8 +864,7 @@ class MainActivity : AppCompatActivity() {
             homeCallCard.visibility = View.VISIBLE
             val number = com.callagent.gateway.gsm.GsmCallManager.currentNumber ?: info
             tvHomeCallFrom.text = number
-            val dest = getSharedPreferences("gateway", MODE_PRIVATE)
-                .getString("own_number", "") ?: ""
+            val dest = ownNumberForDisplay()
             tvHomeCallTo.text = if (dest.isNotEmpty()) "Connected to $dest" else "Connected"
             // Inbound is the normal direction for a gateway; a dialler-initiated
             // call is the other way round.
@@ -867,23 +912,22 @@ class MainActivity : AppCompatActivity() {
     /**
      * Signal strength in dBm, or null when the modem has no usable reading.
      *
-     * SignalStrength.getCellSignalStrengths() is API 29 and minSdk here is 26,
-     * so below Q the method does not exist and calling it throws
-     * NoSuchMethodError.  That is an Error, not an Exception, so the try/catch
-     * around the call sites never contained it — on Android 9 this took the
-     * whole Activity down in onCreate, and the app could not be opened at all.
+     * This used to branch.  SignalStrength.getCellSignalStrengths() is API 29
+     * and minSdk was 26, so below Q the method did not exist and calling it
+     * threw NoSuchMethodError.  That is an Error, not an Exception, so the
+     * try/catch around the call sites never contained it — on Android 9 this
+     * took the whole Activity down in onCreate, and the app could not be
+     * opened at all.  The pre-Q reading was getGsmSignalStrength(), which
+     * reports ASU rather than dBm: 0..31 maps linearly onto -113..-51 dBm,
+     * and 99 means unknown.
      *
-     * The pre-Q reading is getGsmSignalStrength(), which reports ASU rather
-     * than dBm: 0..31 maps linearly onto -113..-51 dBm, and 99 means unknown.
+     * minSdk is 31 now, above API 29, so that entire fallback — and its
+     * @Suppress("DEPRECATION") — is deleted; getCellSignalStrengths() can no
+     * longer hit a device where it is missing.
      */
-    @Suppress("DEPRECATION")
     private fun signalDbm(ss: android.telephony.SignalStrength?): Int? {
         if (ss == null) return null
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            return ss.cellSignalStrengths.firstOrNull()?.dbm
-        }
-        val asu = ss.gsmSignalStrength
-        return if (asu in 0..31) -113 + 2 * asu else null
+        return ss.cellSignalStrengths.firstOrNull()?.dbm
     }
 
     @SuppressLint("MissingPermission")
@@ -959,8 +1003,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun showSmsDetails(entry: CallLogEntry) {
         val outgoing = entry.direction != "IN"
-        val own = getSharedPreferences("gateway", MODE_PRIVATE)
-            .getString("own_number", "").orEmpty()
+        val own = ownNumberForDisplay()
 
         // A message still in flight has fresher paperwork in the outbox.
         val live = entry.smsId.takeIf { it.isNotEmpty() }
@@ -1104,15 +1147,14 @@ class MainActivity : AppCompatActivity() {
             appendLine("Roaming      : ${if (tm.isNetworkRoaming) "yes" else "no"}")
             appendLine("Data network : ${networkTypeName(tm.dataNetworkType)}")
             appendLine("Voice network: ${networkTypeName(tm.voiceNetworkType)}")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                tm.signalStrength?.cellSignalStrengths?.forEachIndexed { i, c ->
-                    appendLine(
-                        "Signal[$i]    : ${c.dbm} dBm, level ${c.level}/4 " +
-                            "(${c.javaClass.simpleName.removePrefix("CellSignalStrength")})"
-                    )
-                }
-            } else {
-                signalDbm(tm.signalStrength)?.let { appendLine("Signal       : $it dBm") }
+            // getCellSignalStrengths() is API 29, below minSdk 31, so this is
+            // unconditional; the pre-Q else-branch that read ASU off
+            // gsmSignalStrength went away with the version check.
+            tm.signalStrength?.cellSignalStrengths?.forEachIndexed { i, c ->
+                appendLine(
+                    "Signal[$i]    : ${c.dbm} dBm, level ${c.level}/4 " +
+                        "(${c.javaClass.simpleName.removePrefix("CellSignalStrength")})"
+                )
             }
         } catch (e: Exception) {
             appendLine("telephony: ${e.message}")
@@ -1204,8 +1246,9 @@ class MainActivity : AppCompatActivity() {
                     ?.let { row("Carrier", it) }
                 row("Signal", sig(info.cellSignalStrength))
             }
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                info is android.telephony.CellInfoNr -> {
+            // CellInfoNr is API 29, below minSdk 31, so the existence check
+            // that used to guard this branch is gone.
+            info is android.telephony.CellInfoNr -> {
                 val id = info.cellIdentity as? android.telephony.CellIdentityNr
                 row("Type", "5G NR ($role)")
                 row("NCI", id?.nci?.toString() ?: "—")
@@ -1237,12 +1280,11 @@ class MainActivity : AppCompatActivity() {
             }
             else -> {
                 row("Type", "${info.javaClass.simpleName.removePrefix("CellInfo")} ($role)")
-                // The CellInfo base class only grew getCellSignalStrength() in
-                // API 30; every branch above reads it off its own subclass,
+                // CellInfo.getCellSignalStrength() landed in API 30, below
+                // minSdk 31, so the version guard that used to sit here is
+                // gone; every branch above reads it off its own subclass,
                 // which has had it since 17.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    row("Signal", sig(info.cellSignalStrength))
-                }
+                row("Signal", sig(info.cellSignalStrength))
             }
         }
     }
@@ -1254,11 +1296,12 @@ class MainActivity : AppCompatActivity() {
      */
     private fun wifiSecurityName(info: android.net.wifi.WifiInfo?): String {
         if (info == null) return "—"
-        // getCurrentSecurityType() is API 31.  The catch below does not stand in
-        // for a version check: a missing method raises NoSuchMethodError, which
-        // is an Error rather than an Exception, so it would pass straight
-        // through and take the dialog down.
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return "—"
+        // getCurrentSecurityType() is API 31 — exactly minSdk now, so the
+        // pre-S early return that used to sit here is gone.  The catch below
+        // is no longer standing in for a version check either: a missing
+        // method raises NoSuchMethodError (an Error, not an Exception) and
+        // would still take the dialog down, so it is purely belt-and-braces
+        // against OEM stubs that return a constant we do not know yet.
         return try {
             when (info.currentSecurityType) {
                 android.net.wifi.WifiInfo.SECURITY_TYPE_OPEN -> "open (none)"
@@ -1455,240 +1498,17 @@ class MainActivity : AppCompatActivity() {
         unregisterReceiver(statusReceiver)
     }
 
-    // ── Config Dialog ────────────────────────────────────
-
-    // ── Info Dialog ─────────────────────────────────────
-
-    @SuppressLint("MissingPermission")
-    // ── Gateway Support Checks ─────────────────────────
-
-    private fun runGatewayChecks(container: LinearLayout, onDone: () -> Unit) {
-        val dp = resources.displayMetrics.density
-        val greenColor = Color.parseColor("#16A34A")
-        val redColor = Color.parseColor("#DC2626")
-        val grayColor = Color.parseColor("#6B7280")
-
-        fun addSectionHeader(title: String) {
-            val tv = TextView(this).apply {
-                text = title
-                textSize = 13f
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.primary))
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                setPadding(0, (8 * dp).toInt(), 0, (2 * dp).toInt())
-            }
-            container.addView(tv)
-        }
-
-        fun addResultRow(label: String, passed: Boolean, detail: String = "") {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, (3 * dp).toInt(), 0, (3 * dp).toInt())
-            }
-            val icon = TextView(this).apply {
-                text = if (passed) "\u2713" else "\u2717"
-                textSize = 14f
-                setTextColor(if (passed) greenColor else redColor)
-                layoutParams = LinearLayout.LayoutParams((20 * dp).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
-            }
-            val tvLabel = TextView(this).apply {
-                text = label
-                textSize = 13f
-                setTextColor(if (passed) greenColor else redColor)
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            row.addView(icon)
-            row.addView(tvLabel)
-            if (detail.isNotEmpty()) {
-                val tvDetail = TextView(this).apply {
-                    text = detail
-                    textSize = 11f
-                    setTextColor(grayColor)
-                }
-                row.addView(tvDetail)
-            }
-            container.addView(row)
-        }
-
-        Thread {
-            data class CheckResult(val label: String, val passed: Boolean, val detail: String = "")
-            val results = mutableListOf<CheckResult>()
-
-            val hasRecordAudio = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-
-            val hasPhoneState = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.READ_PHONE_STATE
-            ) == PackageManager.PERMISSION_GRANTED
-
-            val hasAnswerCalls = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ANSWER_PHONE_CALLS
-            ) == PackageManager.PERMISSION_GRANTED
-
-            val hasCallPhone = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.CALL_PHONE
-            ) == PackageManager.PERMISSION_GRANTED
-
-            val hasCaptureOutput = ContextCompat.checkSelfPermission(
-                this, "android.permission.CAPTURE_AUDIO_OUTPUT"
-            ) == PackageManager.PERMISSION_GRANTED
-
-            results.add(CheckResult("RECORD_AUDIO", hasRecordAudio))
-            results.add(CheckResult("CAPTURE_AUDIO_OUTPUT", hasCaptureOutput, if (hasCaptureOutput) "Magisk" else "needs Magisk"))
-            results.add(CheckResult("ANSWER_PHONE_CALLS", hasAnswerCalls))
-            results.add(CheckResult("CALL_PHONE", hasCallPhone))
-            results.add(CheckResult("READ_PHONE_STATE", hasPhoneState))
-
-            val telecomMgr = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            val isDefaultDialer = packageName == telecomMgr.defaultDialerPackage
-            results.add(CheckResult("Default Dialer", isDefaultDialer, if (isDefaultDialer) "" else "required for InCallService"))
-
-            data class SourceTest(val source: Int, val name: String, val rate: Int)
-            val sources = listOf(
-                SourceTest(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000),
-                SourceTest(MediaRecorder.AudioSource.VOICE_UPLINK, "VOICE_UPLINK", 8000),
-                SourceTest(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000),
-                SourceTest(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000),
-                SourceTest(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000),
-                SourceTest(MediaRecorder.AudioSource.MIC, "MIC", 8000)
-            )
-
-            val sourceResults = mutableListOf<CheckResult>()
-            for (src in sources) {
-                var ok = false
-                var detail = ""
-                try {
-                    val minBuf = AudioRecord.getMinBufferSize(
-                        src.rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-                    )
-                    if (minBuf > 0) {
-                        val rec = AudioRecord(
-                            src.source, src.rate,
-                            AudioFormat.CHANNEL_IN_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            minBuf.coerceAtLeast(4096)
-                        )
-                        if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                            try {
-                                rec.startRecording()
-                                val buf = ByteArray(320)
-                                val read = rec.read(buf, 0, buf.size)
-                                ok = read > 0
-                                if (!ok) detail = "read=$read"
-                                rec.stop()
-                            } catch (e: Exception) {
-                                detail = e.message?.take(30) ?: "start failed"
-                            }
-                        } else {
-                            detail = "init failed"
-                        }
-                        rec.release()
-                    } else {
-                        detail = "invalid buffer"
-                    }
-                } catch (e: Exception) {
-                    detail = e.message?.take(30) ?: "error"
-                }
-                sourceResults.add(CheckResult(src.name, ok, detail))
-            }
-
-            val aecAvail = AcousticEchoCanceler.isAvailable()
-            val nsAvail = NoiseSuppressor.isAvailable()
-
-            data class PropCheck(val prop: String, val expected: String, val label: String)
-            val propChecks = listOf(
-                PropCheck("voice.record.conc.disabled", "false", "Concurrent recording"),
-                PropCheck("voice.playback.conc.disabled", "false", "Concurrent playback"),
-                PropCheck("voice.voip.conc.disabled", "false", "Concurrent VoIP")
-            )
-            val propResults = mutableListOf<CheckResult>()
-            for (pc in propChecks) {
-                val value = try {
-                    @Suppress("PrivateApi")
-                    val cls = Class.forName("android.os.SystemProperties")
-                    val get = cls.getMethod("get", String::class.java, String::class.java)
-                    get.invoke(null, pc.prop, "") as String
-                } catch (_: Exception) { "" }
-                val ok = value == pc.expected
-                propResults.add(CheckResult(pc.label, ok, if (value.isNotEmpty()) "$value" else "not set"))
-            }
-
-            val hasRoot = try {
-                // Modern Magisk doesn't place su at fixed paths — try executing it.
-                val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-                val exitCode = proc.waitFor()
-                proc.destroy()
-                exitCode == 0
-            } catch (_: Exception) {
-                // Fallback: check legacy paths
-                try {
-                    java.io.File("/system/bin/su").exists() ||
-                        java.io.File("/system/xbin/su").exists() ||
-                        java.io.File("/sbin/su").exists()
-                } catch (_: Exception) { false }
-            }
-
-            val hasUsableSource = sourceResults.any { it.passed }
-            val hasDownlink = sourceResults.firstOrNull { it.label == "VOICE_DOWNLINK" }?.passed == true
-
-            runOnUiThread {
-                addSectionHeader("Permissions")
-                for (r in results) addResultRow(r.label, r.passed, r.detail)
-
-                addSectionHeader("Audio Sources")
-                for (r in sourceResults) addResultRow(r.label, r.passed, r.detail)
-
-                addSectionHeader("Audio Effects")
-                addResultRow("AcousticEchoCanceler", aecAvail)
-                addResultRow("NoiseSuppressor", nsAvail)
-
-                addSectionHeader("System Properties")
-                for (r in propResults) addResultRow(r.label, r.passed, r.detail)
-
-                addSectionHeader("System")
-                addResultRow("Root (su)", hasRoot, if (hasRoot) "" else "needed for Magisk")
-
-                val divider = View(this).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, (1 * dp).toInt()
-                    ).apply { topMargin = (8 * dp).toInt(); bottomMargin = (8 * dp).toInt() }
-                    setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.border_card))
-                }
-                container.addView(divider)
-
-                val gatewayReady = hasRecordAudio && isDefaultDialer && hasUsableSource && hasCaptureOutput
-                val verdict = TextView(this).apply {
-                    text = if (gatewayReady) {
-                        val src = if (hasDownlink) "VOICE_DOWNLINK" else
-                            sourceResults.firstOrNull { it.passed }?.label ?: "?"
-                        "\u2713 Gateway supported (capture: $src)"
-                    } else {
-                        val missing = mutableListOf<String>()
-                        if (!hasRecordAudio) missing.add("RECORD_AUDIO")
-                        if (!hasCaptureOutput) missing.add("CAPTURE_AUDIO_OUTPUT")
-                        if (!isDefaultDialer) missing.add("Default Dialer")
-                        if (!hasUsableSource) missing.add("audio source")
-                        "\u2717 Not ready: missing ${missing.joinToString(", ")}"
-                    }
-                    textSize = 13f
-                    setTextColor(if (gatewayReady) greenColor else redColor)
-                    setTypeface(null, android.graphics.Typeface.BOLD)
-                }
-                container.addView(verdict)
-
-                onDone()
-            }
-        }.start()
-    }
-
     private fun networkTypeName(type: Int): String = when (type) {
         TelephonyManager.NETWORK_TYPE_GPRS,
         TelephonyManager.NETWORK_TYPE_EDGE,
         TelephonyManager.NETWORK_TYPE_CDMA,
         TelephonyManager.NETWORK_TYPE_1xRTT,
-        @Suppress("DEPRECATION")
-        TelephonyManager.NETWORK_TYPE_IDEN -> "2G"
+        // NETWORK_TYPE_IDEN removed: deprecated in API 34 with no replacement
+        // ("legacy network type no longer being used"), and every iDEN carrier
+        // shut down over a decade ago, so nothing can report it.  An unmatched
+        // value falls through to the else below and reads as unknown, which is
+        // what a network nobody has ever seen on this hardware should say.
+        TelephonyManager.NETWORK_TYPE_UMTS,
         TelephonyManager.NETWORK_TYPE_UMTS,
         TelephonyManager.NETWORK_TYPE_EVDO_0,
         TelephonyManager.NETWORK_TYPE_EVDO_A,
@@ -1897,9 +1717,10 @@ class MainActivity : AppCompatActivity() {
             // returned "<unknown ssid>" without location since Android 8.1).
             // Both degrade to a placeholder instead.
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            perms.add(Manifest.permission.READ_PHONE_NUMBERS)
-        }
+        // READ_PHONE_NUMBERS exists from API 30, below minSdk 31, so its
+        // version check is gone.  POST_NOTIFICATIONS stays gated: it is a
+        // genuine API 33 addition and requesting it on an older build throws.
+        perms.add(Manifest.permission.READ_PHONE_NUMBERS)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -1916,19 +1737,15 @@ class MainActivity : AppCompatActivity() {
         val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         if (packageName == tm.defaultDialerPackage) return
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val rm = getSystemService(Context.ROLE_SERVICE) as RoleManager
-            if (rm.isRoleAvailable(RoleManager.ROLE_DIALER) &&
-                !rm.isRoleHeld(RoleManager.ROLE_DIALER)
-            ) {
-                dialerRoleLauncher.launch(rm.createRequestRoleIntent(RoleManager.ROLE_DIALER))
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            val intent = Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).apply {
-                putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName)
-            }
-            dialerRoleLauncher.launch(intent)
+        // minSdk 31 >= API 29, so RoleManager is the only path.  The
+        // pre-Q ACTION_CHANGE_DEFAULT_DIALER broadcast it replaces was
+        // deprecated in Android 10 and is ignored by modern builds, so the
+        // whole @Suppress("DEPRECATION") fallback goes with the version check.
+        val rm = getSystemService(Context.ROLE_SERVICE) as RoleManager
+        if (rm.isRoleAvailable(RoleManager.ROLE_DIALER) &&
+            !rm.isRoleHeld(RoleManager.ROLE_DIALER)
+        ) {
+            dialerRoleLauncher.launch(rm.createRequestRoleIntent(RoleManager.ROLE_DIALER))
         }
     }
 

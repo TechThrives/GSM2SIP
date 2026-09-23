@@ -3,10 +3,10 @@ package com.callagent.gateway.sms
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.provider.Telephony
 import android.telephony.SubscriptionManager
 import android.util.Log
+import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
 import com.callagent.gateway.service.GatewayService
@@ -91,17 +91,22 @@ class SmsReceiver : BroadcastReceiver() {
                 ?: return Triple(-1, "", "")
             @Suppress("MissingPermission")
             val info = sm.getActiveSubscriptionInfo(subId) ?: return Triple(-1, "", "")
-            val number = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                @Suppress("DEPRECATION")
-                runCatching { info.number }.getOrDefault("")
-            } else {
-                @Suppress("DEPRECATION")
-                runCatching { info.number }.getOrDefault("")
-            }
+            // SubscriptionInfo.getNumber() has been deprecated since 33, and
+            // builds disagree about whether they still populate it — the kind
+            // of split that only ever shows up on hardware nobody has in
+            // front of them.  It stays first so a device where it works is
+            // byte-identical to before, and OwnNumber fills the gap where it
+            // does not.  Using that helper rather than a third private read is
+            // the point: routing, the loop guard and this header can no longer
+            // disagree about one SIM's number.
+            @Suppress("DEPRECATION")
+            val number = runCatching { info.number }.getOrNull()?.trim()
+                ?.ifEmpty { null }
+                ?: OwnNumber.fromSim(context, subId).orEmpty()
             Triple(
                 info.simSlotIndex,
                 info.carrierName?.toString().orEmpty(),
-                number.orEmpty()
+                number
             )
         } catch (e: Exception) {
             // Reading subscription details needs READ_PHONE_STATE, and the

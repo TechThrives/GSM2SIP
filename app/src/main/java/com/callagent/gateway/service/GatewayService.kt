@@ -14,7 +14,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.telephony.TelephonyManager
@@ -27,6 +26,7 @@ import android.util.Log
 import com.callagent.gateway.BuildConfig
 import com.callagent.gateway.GatewayApp
 import com.callagent.gateway.MainActivity
+import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.R
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.bridge.CallOrchestrator
@@ -59,14 +59,22 @@ class GatewayService : Service() {
     private var currentLocalIp = ""
 
     // ── Call tracking ───────────────────────────────────
-    private var onlineSince = 0L
-    private var incomingCalls = 0
-    private var incomingDurationSec = 0L
-    private var outgoingCalls = 0
-    private var outgoingDurationSec = 0L
-    private var currentCallStart = 0L
-    private var currentCallIncoming = true
-    private var currentCallNumber = ""
+    //
+    // These are written from the orchestrator's listener callback — which
+    // runs on whatever thread reported the state change, SIP receive or
+    // Telecom — and read from broadcastStatus()/reloadStats() on other
+    // threads.  Without a fence a reader can be handed a stale value for an
+    // arbitrary length of time; the counters are what the UI displays, so a
+    // missed update looks like the call never happened.
+    @Volatile private var onlineSince = 0L
+    @Volatile private var incomingCalls = 0
+    @Volatile private var incomingDurationSec = 0L
+    @Volatile private var outgoingCalls = 0
+    @Volatile private var outgoingDurationSec = 0L
+    @Volatile private var currentCallStart = 0L
+    @Volatile private var currentAttemptStart = 0L
+    @Volatile private var currentCallIncoming = true
+    @Volatile private var currentCallNumber = ""
 
     /** When the call first appeared, bridged or not.
      *
@@ -75,7 +83,6 @@ class GatewayService : Service() {
      *  rejected, an outbound number that never connected, a caller who hung up
      *  while it was ringing — used to leave no trace in the log at all.  Those
      *  are the calls most worth having a record of. */
-    private var currentAttemptStart = 0L
 
     /** Prevents concurrent startGateway / reconnect threads */
     private val initializing = AtomicBoolean(false)
@@ -212,7 +219,12 @@ class GatewayService : Service() {
             try {
                 val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                 cm.unregisterNetworkCallback(it)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                // Usually IllegalArgumentException from a callback that was
+                // already unregistered — benign, but it also fires when the
+                // registration never happened, which is not.
+                Log.w(TAG, "Network callback unregister failed: ${e.message}")
+            }
         }
         networkCallback = null
     }
@@ -433,6 +445,33 @@ class GatewayService : Service() {
     }
 
     /**
+     * Apply the settings that are global state rather than SipClient inputs.
+     *
+     * Codec and the agent-volume step are read out of prefs into process-wide
+     * singletons ([com.callagent.gateway.sip.SipBuilder.codecMode],
+     * [com.callagent.gateway.gsm.GsmCallManager.agentVolumeStep]).  They are
+     * not passed to SipClient's constructor, so initSipClient()'s re-read of
+     * sip_tls/use_stun/srtp_enabled does not pick them up — they were only
+     * ever read in startGateway().  A user who changed codec and pressed Save
+     * got "Saved — reconnecting", and the gateway carried on with the old
+     * codec until the *service process* was killed, because a reconnect never
+     * runs startGateway().
+     *
+     * Called from both bring-up paths so the two cannot drift apart again.
+     */
+    private fun applyRuntimeConfig(prefs: android.content.SharedPreferences) {
+        // Codec preference is a property of the SDP we build, so it has to be
+        // in place before the first INVITE goes out.
+        com.callagent.gateway.sip.SipBuilder.codecMode =
+            prefs.getString("codec", "g722") ?: "g722"
+
+        // The agent's level into the GSM uplink, as a step away from what the
+        // device profile asks for.
+        com.callagent.gateway.gsm.GsmCallManager.agentVolumeStep =
+            prefs.getInt("agent_vol_step", 0)
+    }
+
+    /**
      * Re-read the saved configuration and rebuild the SIP client with it.
      *
      * ACTION_RECONNECT deliberately only asks the *existing* client to
@@ -470,6 +509,10 @@ class GatewayService : Service() {
             return
         }
         broadcastLog("Config changed — rebuilding SIP client")
+        // Codec and agent volume are not SipClient inputs, so the rebuild
+        // below would not pick them up.  Apply them here, or a settings save
+        // silently does nothing for those two until the process restarts.
+        applyRuntimeConfig(prefs)
         // A save is an explicit instruction, so it outranks a bring-up that
         // is already in flight; the generation counter makes discarding that
         // one safe.
@@ -840,22 +883,56 @@ class GatewayService : Service() {
     /**
      * The gateway's own number for the SIM that carried this message.
      *
-     * With one SIM this is just own_number.  With more than one it has to be
+     * With one SIM this is just its own box.  With more than one it has to be
      * the number of the SIM the message actually arrived on or left by, or
      * the server maps it to the wrong assistant -- both SIMs reach the same
-     * gateway, and only the number distinguishes them.  Falls back to the
-     * single legacy value whenever the SIM cannot be resolved.
+     * gateway, and only the number distinguishes them.
+     *
+     * The same two steps an inbound call takes, in the same order and through
+     * the same OwnNumber helper, so a message and a call from one SIM can
+     * never name two different DIDs.  This function did not read the SIM at
+     * all until now -- box only -- while the comment on sendSmsOverSip()
+     * already promised it did.
+     *
+     * It returns empty rather than borrowing another slot's box.  Both
+     * callers already fall through to the SIP account on empty, which is the
+     * loud answer: guessing the lowest slot's number instead would map the
+     * message to the other SIM's assistant without saying so.
      */
     private fun ownNumberForSub(subId: Int): String {
+        OwnNumber.fromSim(this, subId)?.let {
+            Log.i(TAG, "SMS own number from SIM (sub=$subId): $it")
+            return it
+        }
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val fallback = prefs.getString("own_number", "")?.trim().orEmpty()
-        if (subId < 0) return fallback
+        // No SIM to name: there is no slot to look a box up under, so hand
+        // back nothing and let the caller's own fallback stand.  Every empty
+        // return below logs first — "which SIM sent this?" has to be
+        // answerable from the log afterwards, and a silent substitution is
+        // exactly the failure mode this chain was tightened to remove.
+        if (subId < 0) {
+            Log.w(TAG, "SMS own number unavailable (sub=$subId is not a subscription) — using the SIP account")
+            return ""
+        }
         val slot = runCatching {
             getSystemService(android.telephony.SubscriptionManager::class.java)
                 ?.getActiveSubscriptionInfo(subId)?.simSlotIndex
-        }.getOrNull() ?: return fallback
-        return prefs.getString("own_number_slot_$slot", "")?.trim()
-            ?.ifEmpty { null } ?: fallback
+        }.getOrNull()
+        if (slot == null || slot < 0) {
+            Log.w(TAG, "SMS own number unavailable (sub=$subId has no slot) — using the SIP account")
+            return ""
+        }
+        val configured = prefs.getString("own_number_slot_$slot", "")?.trim().orEmpty()
+        if (configured.isEmpty()) {
+            Log.w(TAG, "SMS own number unavailable (sub=$subId, slot $slot box empty) — using the SIP account")
+        } else {
+            // Deliberately Log.i, and deliberately naming the slot: on a
+            // carrier that publishes no number this line is the only evidence
+            // that the *box* was consulted rather than the SIM, which is the
+            // whole difference between correct-by-construction and silent.
+            Log.i(TAG, "SMS own number from settings (sub=$subId, slot $slot): $configured")
+        }
+        return configured
     }
 
     /**
@@ -1062,16 +1139,7 @@ class GatewayService : Service() {
             .putString("pass", password)
             .apply()
 
-        // Codec preference is a property of the SDP we build, so it has to be
-        // in place before the first INVITE goes out.
-        com.callagent.gateway.sip.SipBuilder.codecMode =
-            prefs.getString("codec", "g722") ?: "g722"
-
-        // The agent's level into the GSM uplink, as a step away from what the
-        // device profile asks for.  Read here so a change applies on save
-        // rather than waiting for the next call.
-        com.callagent.gateway.gsm.GsmCallManager.agentVolumeStep =
-            prefs.getInt("agent_vol_step", 0)
+        applyRuntimeConfig(prefs)
 
         cfgServer = server
         cfgPort = port
@@ -1079,19 +1147,15 @@ class GatewayService : Service() {
         cfgPass = password
 
         notifStatusText = "Connecting"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                activeNotificationId(),
-                buildNotification(NotifState.WARN, "Connecting"),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
-        } else {
-            startForeground(
-                activeNotificationId(),
-                buildNotification(NotifState.WARN, "Connecting")
-            )
-        }
+        // minSdk 31 >= API 29, so the typed overload (and its
+        // foregroundServiceType declaration) is the only path; the untyped
+        // one is dead code below Android 10.
+        startForeground(
+            activeNotificationId(),
+            buildNotification(NotifState.WARN, "Connecting"),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        )
         acquireLocks()
         initializing.set(true)
         initializingSince = System.currentTimeMillis()
@@ -1113,8 +1177,13 @@ class GatewayService : Service() {
 
     /** Shared SIP init — called from both startGateway and reconnect threads. */
     private fun initSipClient(gen: Int) {
-        /** True while this thread is still the newest bring-up. */
-        fun current() = gen == initGeneration.get()
+        /** True while this thread is still the newest bring-up.
+         *
+         *  [stopped] is folded in as well as the generation: stopGateway()
+         *  sets `stopped` before it tears anything down, and without it this
+         *  check passed for a thread that was starting a gateway the user had
+         *  just stopped — the generation alone does not move on a stop. */
+        fun current() = !stopped && gen == initGeneration.get()
 
         if (!current()) {
             Log.w(TAG, "initSipClient: superseded before start (gen $gen)")
@@ -1299,15 +1368,30 @@ class GatewayService : Service() {
         sip.onConnectionLost = { reconnect() }
 
         // Last check before anything binds a socket: if a newer bring-up has
-        // started meanwhile, this client must not exist at all.
+        // started meanwhile — or the gateway was stopped — this client must
+        // not exist at all.  `current()` covers both the generation bump that
+        // stopGateway() now performs and its `stopped` flag, so a stop that
+        // lands while this thread is between building the client and starting
+        // it is caught here rather than resurrecting the registration.
         if (!current() || sipClient !== sip) {
-            Log.w(TAG, "initSipClient: superseded before start (gen $gen) — discarding")
+            Log.w(TAG, "initSipClient: superseded or stopped before start (gen $gen) — discarding")
             orch.stop()
             return
         }
 
         try {
             sip.start()
+            // Belt and braces for the narrow window between the check above
+            // and the socket actually binding: a stop arriving in that gap
+            // would otherwise leave a registered client running behind a
+            // service that has already stopped itself.
+            if (!current() || sipClient !== sip) {
+                Log.w(TAG, "initSipClient: stopped during start (gen $gen) — stopping client")
+                sip.stop()
+                orch.stop()
+                if (sipClient === sip) sipClient = null
+                return
+            }
             broadcastLog("[v${BuildConfig.VERSION_NAME}] SIP client started, registering with $cfgServer:$cfgPort")
             broadcastStatus("STARTING", "Registering with $cfgServer")
         } catch (e: Exception) {
@@ -1322,6 +1406,16 @@ class GatewayService : Service() {
     private fun stopGateway() {
         if (stopped) return
         stopped = true
+        // A SIP init can be in flight while the user stops the gateway —
+        // Magisk `su` and STUN both take seconds, and stopGateway() runs on
+        // the main thread in the meantime.  That thread only re-checks
+        // `current()`, which compares initGeneration, and stopGateway() never
+        // bumped it — so it passed, published its SipClient over the one just
+        // torn down, and called sip.start(), re-registering a gateway the
+        // user had told to stop.  `stopped` alone was not enough either:
+        // current() does not read it.  Bumping the generation here discards
+        // the in-flight bring-up the same way a newer bring-up would.
+        initGeneration.incrementAndGet()
         onlineSince = 0L
         Log.i(TAG, "Stopping gateway")
         orchestrator?.stop()
@@ -1634,7 +1728,9 @@ class GatewayService : Service() {
             val pollMs = 3_000L
             val waitStart = System.currentTimeMillis()
             while (System.currentTimeMillis() - waitStart < maxWaitMs) {
-                val uidProbe = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+                // minSdk 31 >= API 29, so --uid is unconditional: appops set it
+                // per-package before Android 10, per-uid after.
+                val uidProbe = "--uid "
                 val probe = RootShell.execForOutput(
                     "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
                 )
@@ -1653,9 +1749,10 @@ class GatewayService : Service() {
             }
 
             val t0 = System.currentTimeMillis()
-            val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
-            val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+            // minSdk 31 >= API 30, so the auto-revoke opt-out always applies.
+            val autoRevoke =
+                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; "
+            val uidFlag = "--uid "
             val result = RootShell.execForOutput(
                 "killall com.google.android.permissioncontroller 2>/dev/null; " +
                 "killall com.android.permissioncontroller 2>/dev/null; " +

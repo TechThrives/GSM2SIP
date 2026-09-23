@@ -23,6 +23,48 @@ object SmsSender {
     const val EXTRA_PART = "sms_part"
 
     /**
+     * Request codes for PendingIntents, handed out in strictly increasing
+     * order and persisted across process restarts.
+     *
+     * These used to be derived from `id.hashCode()` — a 32-bit hash of a
+     * UUID string, folded into an Int.  `PendingIntent.getBroadcast` matches
+     * on request code + action + component and ignores extras, so two
+     * messages whose hashes collided on the same code would silently
+     * *overwrite* each other's extras under FLAG_UPDATE_CURRENT.  The
+     * carrier's callback for the first message would then arrive carrying
+     * the second message's id/part and book the delivery against the wrong
+     * record.  With many messages in flight over a long-running gateway the
+     * birthday bound makes that a matter of time, not luck.
+     *
+     * A counter cannot collide.  It is seeded from prefs because the
+     * platform's PendingIntent table survives the app process: restarting at
+     * zero would reissue codes the system still holds entries for, which is
+     * the same overwrite in a different costume.  Prefs are read once and
+     * written back with commit(), synchronously: apply()'s write is async,
+     * so a process killed between the increment and it landing on disk would
+     * restart one code behind and could reissue codes the system still
+     * holds.  One write per outbound SMS part is well off the hot path, so
+     * the synchronous cost is free where it matters.
+     *
+     * Negative codes are legal but avoided: masking to 31 bits keeps every
+     * code a clean positive Int, which is easier to read in a bug report.
+     */
+    private val requestCodeSeq = java.util.concurrent.atomic.AtomicInteger(-1)
+
+    private fun nextRequestCode(context: Context): Int {
+        val prefs = context.getSharedPreferences("sms_pending", Context.MODE_PRIVATE)
+        val seq = requestCodeSeq
+        if (seq.get() < 0) {
+            // Seed from the persisted counter, one ahead of anything already
+            // handed out, so a restart cannot reuse a live code.
+            seq.compareAndSet(-1, prefs.getInt("next_request_code", 0).coerceAtLeast(1))
+        }
+        val code = (seq.getAndIncrement() and 0x7fffffff).coerceAtLeast(1)
+        prefs.edit().putInt("next_request_code", seq.get()).commit()
+        return code
+    }
+
+    /**
      * Send one queued message.  Returns false if the modem refused it outright,
      * in which case nothing will ever call back and the caller must report the
      * failure itself.
@@ -62,8 +104,16 @@ object SmsSender {
      * is used whenever the request names one.
      */
     private fun smsManagerFor(context: Context, subId: Int): SmsManager {
+        // context.getSystemService(SmsManager::class.java) IS the replacement
+        // that SmsManager.getDefault() has pointed at since it was deprecated
+        // in API 31, and minSdk is 31 — so the deprecated fallback is dead
+        // weight now.  Dropping it also changes what a null means: instead of
+        // silently falling back to the default-SIM manager (which on a
+        // dual-SIM device can send the reply out of the wrong box — the exact
+        // failure this function exists to prevent), it fails loudly.  A null
+        // here means the platform never registered the service at all.
         val base = context.getSystemService(SmsManager::class.java)
-            ?: @Suppress("DEPRECATION") SmsManager.getDefault()
+            ?: error("SmsManager system service unavailable")
         return if (subId >= 0 && subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
             runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
         } else {
@@ -83,6 +133,13 @@ object SmsSender {
      * bare "modem_err" with no reason, and why every delivery report parsed as
      * status=unknown.  The intent is explicit — our own package, our own
      * receiver class — so nothing else can be targeted through it.
+     *
+     * Each call takes its own request code from [nextRequestCode] rather than
+     * one derived from the message id: `PendingIntent` matches on request
+     * code + action + component and ignores extras, so two live codes that
+     * collide make FLAG_UPDATE_CURRENT overwrite the first message's extras
+     * with the second's, and the first callback is then booked against the
+     * wrong record.
      */
     private fun pendingIntent(context: Context, action: String, id: String, part: Int): PendingIntent {
         val intent = Intent(action).apply {
@@ -91,7 +148,7 @@ object SmsSender {
             putExtra(EXTRA_ID, id)
             putExtra(EXTRA_PART, part)
         }
-        val requestCode = (id.hashCode() * 31 + part) * 2 + if (action == ACTION_SENT) 0 else 1
+        val requestCode = nextRequestCode(context)
         return PendingIntent.getBroadcast(
             context, requestCode, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE

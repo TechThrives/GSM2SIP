@@ -37,8 +37,25 @@ object GsmCallManager {
     private const val TAG = "GsmCallManager"
 
 
-    /** Active device profile — initialized on first use. */
-    val profile: DeviceProfile by lazy { DeviceProfile.detect() }
+    /** Active device profile — initialized on first use.
+     *
+     *  Not a plain `by lazy { DeviceProfile.detect() }`: Kotlin's default
+     *  lazy mode caches *and rethrows* an initializer exception on every
+     *  later access, with no retry.  If detect() ever threw on the first
+     *  call — a `Build.*` field misbehaving on some OEM ROM is the realistic
+     *  case — then every subsequent `GsmCallManager.profile` would throw too,
+     *  and the gateway could never bridge another call without a process
+     *  restart.  Detection is best-effort by nature, so a failure degrades to
+     *  the generic profile instead of poisoning the whole app. */
+    val profile: DeviceProfile by lazy {
+        try {
+            DeviceProfile.detect()
+        } catch (e: Exception) {
+            Log.e(TAG, "DeviceProfile.detect() failed — falling back to generic profile: " +
+                "${e.javaClass.simpleName}: ${e.message}")
+            DeviceProfile.generic()
+        }
+    }
 
     // Current active GSM call
     @Volatile var activeCall: Call? = null; private set
@@ -83,8 +100,11 @@ object GsmCallManager {
     fun onCallAdded(call: Call, service: InCallService) {
         inCallService = service
         activeCall = call
-        @Suppress("DEPRECATION")
-        activeCallState = call.state
+        // Call.getState() was deprecated in API 31 — exactly minSdk — for
+        // Call.Details.getState().  Same value, same source; the suppression
+        // goes with it.  STATE_NEW on a null Details matches this field's own
+        // initialiser, so the orchestrator still sees "no live state yet".
+        activeCallState = call.details?.state ?: Call.STATE_NEW
         lastDisconnectCause = null
         // Release the previous call's object; the dedupe only needs to span
         // one call's own disconnect.
@@ -92,8 +112,9 @@ object GsmCallManager {
 
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
 
-        @Suppress("DEPRECATION")
-        when (call.state) {
+        // Same API 31 migration as the assignment above: getState() only ever
+        // forwarded to Details, so read it there directly.
+        when (call.details?.state ?: Call.STATE_NEW) {
             Call.STATE_RINGING -> {
                 Log.i(TAG, "Incoming GSM call from $number")
                 // Silence the ringtone immediately — this is a gateway device,
@@ -418,7 +439,13 @@ object GsmCallManager {
                             Thread.sleep(profile.routeChangeDelayMs)
                             enforceVolumes(am)
                             batchMixerSetup()
-                        } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            // Was silent: a failure here meant the delayed
+                            // mixer setup never ran and volumes kept whatever
+                            // the immediate pass left behind, with nothing in
+                            // logcat to say the second pass was skipped.
+                            Log.w(TAG, "Delayed volume/mixer enforce failed: ${e.message}")
+                        }
                     }, "VolEnforce").start()
 
                     // Samsung Exynos re-route dance REMOVED (v2.8.39):
@@ -452,7 +479,9 @@ object GsmCallManager {
         // silencing is handled by muteVoiceRx() at the ALSA mixer level.
         try {
             am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-        } catch (_: SecurityException) {}
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Voice-call stream unmute denied: ${e.message}")
+        }
 
         if (profile.silenceLocalAudio) {
             // Digital bridge: silence the handset itself.  Done through
@@ -460,7 +489,11 @@ object GsmCallManager {
             // mutes which the HAL overwrites when it programs the call path.
             try {
                 am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0)
-            } catch (_: SecurityException) {}
+            } catch (e: SecurityException) {
+                // Was silent: the "Local audio silenced" line below still
+                // printed, claiming the handset was muted when it was not.
+                Log.w(TAG, "Voice-call stream mute denied: ${e.message}")
+            }
             try {
                 am.isMicrophoneMute = true
             } catch (e: Exception) {
@@ -482,7 +515,11 @@ object GsmCallManager {
                 1
             }
             am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
-        } catch (_: SecurityException) {}
+        } catch (e: SecurityException) {
+            // Was silent: the read-back + appLog further down then reported
+            // the actual volume without ever saying the set was refused.
+            Log.w(TAG, "Voice-call volume set denied: ${e.message}")
+        }
         // Music stream controls incall_music injection level into
         // the modem uplink.  Lower value = quieter speaker + quieter
         // agent voice for the GSM caller.
@@ -522,13 +559,20 @@ object GsmCallManager {
 
                     // Unmute voice call stream and restore volume for normal phone use
                     try {
-                        try { am.isMicrophoneMute = false } catch (_: Exception) {}
+                        try { am.isMicrophoneMute = false }
+                        catch (e: Exception) { Log.w(TAG, "Mic unmute on restore failed: ${e.message}") }
                         am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-                    } catch (_: SecurityException) {}
+                    } catch (e: SecurityException) {
+                        // Was silent: the handset stayed muted into the next
+                        // ordinary phone call and nothing traced back here.
+                        Log.w(TAG, "Voice-call stream unmute on restore denied: ${e.message}")
+                    }
                     try {
                         val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
                         am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
-                    } catch (_: SecurityException) {}
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "Voice-call volume restore denied: ${e.message}")
+                    }
                     Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=false")
                 }
             }

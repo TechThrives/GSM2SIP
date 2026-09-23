@@ -17,8 +17,13 @@ class GsmCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
-        @Suppress("DEPRECATION")
-        val state = call.state
+        // Call.getState() was deprecated in API 31 — exactly this app's minSdk —
+        // in favour of Call.Details.getState(), which is where it read from
+        // anyway.  The handle two lines up already treats a null Details as
+        // possible, and STATE_NEW is the value GsmCallManager initialises
+        // activeCallState with, so a missing Details cannot invent a state the
+        // rest of the code would not already accept as "not yet connected".
+        val state = call.details?.state ?: Call.STATE_NEW
         Log.i(TAG, "Call added: number=$number state=$state")
 
         call.registerCallback(callCallback)

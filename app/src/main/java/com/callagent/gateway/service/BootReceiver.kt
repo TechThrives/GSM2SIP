@@ -3,7 +3,6 @@ package com.callagent.gateway.service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.util.Log
 import com.callagent.gateway.RootShell
 
@@ -111,7 +110,9 @@ class BootReceiver : BroadcastReceiver() {
                 val maxWaitMs = 90_000L
                 val pollMs = 3_000L
                 val waitStart = System.currentTimeMillis()
-                val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+                // minSdk 31 >= API 29, so --uid is unconditional: appops set it
+                // per-package before Android 10, per-uid after.
+                val uidFlag = "--uid "
                 while (System.currentTimeMillis() - waitStart < maxWaitMs) {
                     val probe = RootShell.execForOutput(
                         "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
@@ -125,8 +126,9 @@ class BootReceiver : BroadcastReceiver() {
                 }
 
                 val t0 = System.currentTimeMillis()
-                val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                    "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
+                // minSdk 31 >= API 30, so the auto-revoke opt-out always applies.
+                val autoRevoke =
+                    "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; "
                 val result = RootShell.execForOutput(
                     "killall com.google.android.permissioncontroller 2>/dev/null; " +
                     "killall com.android.permissioncontroller 2>/dev/null; " +

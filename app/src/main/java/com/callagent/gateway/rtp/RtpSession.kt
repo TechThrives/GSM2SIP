@@ -3,7 +3,6 @@ package com.callagent.gateway.rtp
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
-import android.os.Build
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -766,7 +765,10 @@ class RtpSession(
 
         // Closing the socket unblocks receiveLoop's blocking receive at once
         // rather than leaving it to time out.
-        try { socket?.close() } catch (_: Exception) {}
+        // If this fails, receiveLoop keeps blocking until its own timeout
+        // instead of waking at once — worth a line in logcat either way.
+        try { socket?.close() }
+        catch (e: Exception) { Log.w(TAG, "Socket close failed: ${e.message}") }
 
         val ws = workers
         workers = emptyList()
@@ -782,16 +784,17 @@ class RtpSession(
             ws.forEach { if (it !== me) it.interrupt() }
             ws.forEach {
                 if (it === me) return@forEach
-                try { it.join(JOIN_TIMEOUT_MS) } catch (_: InterruptedException) {}
+                try { it.join(JOIN_TIMEOUT_MS) }
+                catch (e: InterruptedException) { Log.w(TAG, "Interrupted joining ${it.name}: ${e.message}") }
                 if (it.isAlive) Log.w(TAG, "${it.name} still running after ${JOIN_TIMEOUT_MS}ms")
             }
             rec?.let {
-                try { it.stop() } catch (_: Exception) {}
-                try { it.release() } catch (_: Exception) {}
+                try { it.stop() } catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed: ${e.message}") }
+                try { it.release() } catch (e: Exception) { Log.w(TAG, "AudioRecord release failed: ${e.message}") }
             }
             trk?.let {
-                try { it.stop() } catch (_: Exception) {}
-                try { it.release() } catch (_: Exception) {}
+                try { it.stop() } catch (e: Exception) { Log.w(TAG, "AudioTrack stop failed: ${e.message}") }
+                try { it.release() } catch (e: Exception) { Log.w(TAG, "AudioTrack release failed: ${e.message}") }
             }
             setHalCallState(1)
             Log.i(TAG, "RTP session on port $localPort fully released")
@@ -931,7 +934,8 @@ class RtpSession(
                             Log.w(TAG, msg)
                             listener?.onRtpStats(msg)
                             silentSourceIds.add(currentSourceId)
-                            try { record.stop() } catch (_: Exception) {}
+                            try { record.stop() }
+                            catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed on source switch: ${e.message}") }
                             record.release()
                             audioRecord = null
                             return false
@@ -987,7 +991,8 @@ class RtpSession(
                                 Log.w(TAG, msg)
                                 listener?.onRtpStats(msg)
                                 silentSourceIds.add(currentSourceId)
-                                try { record.stop() } catch (_: Exception) {}
+                                try { record.stop() }
+                                catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed on source switch: ${e.message}") }
                                 record.release()
                                 audioRecord = null
                                 return false  // Signal: try another source
@@ -1367,7 +1372,11 @@ class RtpSession(
                     am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                         ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
                         ?.let { t.setPreferredDevice(it) }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    // Non-fatal: the monitor falls back to whatever route the
+                    // system picked, but that is exactly the case worth seeing.
+                    Log.w(TAG, "Monitor preferred-device routing failed: ${e.message}")
+                }
                 t.play()
                 monitorTrack = t
                 Log.i(TAG, "Monitor ON — both sides on the speaker, mic stays muted")
@@ -1377,8 +1386,8 @@ class RtpSession(
             }
         } else {
             monitorTrack?.let {
-                try { it.stop() } catch (_: Exception) {}
-                try { it.release() } catch (_: Exception) {}
+                try { it.stop() } catch (e: Exception) { Log.w(TAG, "Monitor track stop failed: ${e.message}") }
+                try { it.release() } catch (e: Exception) { Log.w(TAG, "Monitor track release failed: ${e.message}") }
             }
             monitorTrack = null
             Log.i(TAG, "Monitor OFF")
@@ -1741,7 +1750,9 @@ class RtpSession(
     private fun reAssertAppOps() {
         try {
             val pkg = context.packageName
-            val uidProbe = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+            // minSdk 31 >= API 29, so --uid is unconditional: appops set it
+            // per-package before Android 10, per-uid after.
+            val uidProbe = "--uid "
             // Ask before acting.  The sequence below is eight root commands,
             // two of them killing PermissionController, and pm/appops/cmd each
             // fork an app_process; running it unconditionally every 15s cost
@@ -1764,19 +1775,19 @@ class RtpSession(
             // and all errors are captured via 2>&1.
             // AUTO_REVOKE_PERMISSIONS_IF_UNUSED: Android 11+ (API 30)
             // appops --uid flag: Android 10+ (API 29)
-            val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
-            val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
+            // Both are unconditionally present now: minSdk 31 is above both.
+            val autoRevoke =
+                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; "
             val result = RootShell.execForOutput(
                 "killall com.google.android.permissioncontroller 2>/dev/null; " +
                 "killall com.android.permissioncontroller 2>/dev/null; " +
                 "pm grant $pkg android.permission.RECORD_AUDIO 2>&1; " +
                 autoRevoke +
-                "appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
+                "appops set ${uidProbe}$pkg RECORD_AUDIO allow 2>&1; " +
                 "appops set $pkg RECORD_AUDIO allow 2>&1; " +
                 "killall com.google.android.permissioncontroller 2>/dev/null; " +
                 "killall com.android.permissioncontroller 2>/dev/null; " +
-                "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
+                "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             val elapsed = System.currentTimeMillis() - t0
             val allowed = result.contains("allow", ignoreCase = true)
@@ -1785,9 +1796,9 @@ class RtpSession(
             if (!allowed) {
                 // Fallback: try cmd appops (different IPC path to AppOpsService)
                 val fb = RootShell.execForOutput(
-                    "cmd appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
+                    "cmd appops set ${uidProbe}$pkg RECORD_AUDIO allow 2>&1; " +
                     "cmd appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
+                    "cmd appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
                 )
                 Log.w(TAG, "appops fallback cmd: [$fb]")
             } else {
@@ -2046,7 +2057,11 @@ class RtpSession(
                 }
                 lastCpuTicks = totalTicks
                 lastCpuSampleMs = nowMs
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Deliberately quiet: this runs on every stats tick, so a
+                // persistent /proc/self/stat denial would spam logcat.  The
+                // missing " cpu=" field in the emitted line is the signal.
+            }
 
             // Thread count and JVM heap
             val rt = Runtime.getRuntime()

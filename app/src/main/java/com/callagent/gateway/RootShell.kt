@@ -162,7 +162,7 @@ object RootShell {
         if (!alive) init()
         if (!alive) {
             // Fallback: try one-shot su -c
-            return execFallback(cmd)
+            return execFallback(cmd, timeoutMs)
         }
         val command = Command(cmd, CountDownLatch(1))
         commandQueue.put(command)
@@ -176,7 +176,7 @@ object RootShell {
     /** Run a command and return its stdout. */
     fun execForOutput(cmd: String, timeoutMs: Long = 5000): String {
         if (!alive) init()
-        if (!alive) return execFallbackOutput(cmd)
+        if (!alive) return execFallbackOutput(cmd, timeoutMs)
         val command = Command(cmd, CountDownLatch(1))
         commandQueue.put(command)
         if (!command.latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
@@ -206,6 +206,8 @@ object RootShell {
         // actually stops it.
         workerThread?.takeIf { it != Thread.currentThread() }?.interrupt()
         workerThread = null
+        // Best-effort teardown of a shell we have already decided to drop;
+        // the reset itself is logged above, so a close failure adds nothing.
         try { writer?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
         try { process?.destroy() } catch (_: Exception) {}
@@ -274,25 +276,107 @@ object RootShell {
         }
     }
 
-    /** Fallback for when persistent shell fails — single su -c call */
-    private fun execFallback(cmd: String): Int {
+    /**
+     * Drain a subprocess stream on its own daemon thread.
+     *
+     * Both fallback paths need this for the same reason the persistent shell
+     * does: stderr (and, here, stdout, which the caller may not want) is a
+     * pipe with a kernel buffer of a few dozen KB, and nothing reading it
+     * means any command that writes enough blocks forever.  That was exactly
+     * the bug the primary path was hardened against — and the fallback runs
+     * when root is *already* flaky, which is when it matters most.
+     */
+    private fun drainInBackground(stream: java.io.InputStream, tag: String) {
+        Thread({
+            try {
+                BufferedReader(InputStreamReader(stream)).useLines { lines ->
+                    for (line in lines) {
+                        if (line.isNotBlank()) Log.d(TAG, "$tag: $line")
+                    }
+                }
+            } catch (_: Exception) {
+                // Stream closed underneath us as the process exited. Normal.
+            }
+        }, "RootShell-Fallback-$tag").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Fallback for when persistent shell fails — single su -c call.
+     *
+     * The previous version waited five seconds and then simply returned,
+     * leaving the child process alive: the `su` (and whatever it spawned)
+     * stayed behind holding its pipes, one leak per command for as long as
+     * root stayed broken.  Now the process is destroyed on timeout, and both
+     * streams are drained so a chatty command cannot deadlock on a full pipe.
+     */
+    private fun execFallback(cmd: String, timeoutMs: Long = 5000): Int {
+        var proc: Process? = null
         return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            if (proc.waitFor(5, TimeUnit.SECONDS)) proc.exitValue() else -1
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            proc = p
+            drainInBackground(p.errorStream, "fallback-err")
+            // Nobody wants this path's stdout, but it has to be consumed or
+            // the child blocks writing to it and never reaches waitFor's
+            // success case.
+            drainInBackground(p.inputStream, "fallback-out")
+            if (p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                p.exitValue()
+            } else {
+                Log.w(TAG, "Fallback exec timed out after ${timeoutMs}ms: ${cmd.take(80)}")
+                p.destroy()
+                -1
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Fallback exec failed: ${e.message}")
+            try { proc?.destroy() } catch (_: Exception) {}
             -1
         }
     }
 
-    private fun execFallbackOutput(cmd: String): String {
+    /**
+     * Fallback stdout capture.
+     *
+     * This one was worse than the exit-code variant: `readText()` had no
+     * timeout at all, so a command that never closed stdout — a shell prompt
+     * that never exits, a `su` waiting on a permission dialog — hung the
+     * calling thread indefinitely, and the `waitFor(5s)` that followed it
+     * could never run because it was sequenced *after* the blocking read.
+     * The read now happens on its own thread and the wait is the thing that
+     * bounds the call; on timeout the process is destroyed and the partial
+     * output discarded rather than returned as if complete.
+     */
+    private fun execFallbackOutput(cmd: String, timeoutMs: Long = 5000): String {
+        var proc: Process? = null
         return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            val out = proc.inputStream.bufferedReader().readText().trim()
-            proc.waitFor(5, TimeUnit.SECONDS)
-            out
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            proc = p
+            drainInBackground(p.errorStream, "fallback-err")
+
+            val out = StringBuilder()
+            val reader = Thread({
+                try {
+                    BufferedReader(InputStreamReader(p.inputStream)).useLines { lines ->
+                        for (line in lines) {
+                            synchronized(out) { out.appendLine(line) }
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Stream closed as the process exited. Normal.
+                }
+            }, "RootShell-Fallback-out").apply { isDaemon = true; start() }
+
+            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Fallback output timed out after ${timeoutMs}ms: ${cmd.take(80)}")
+                p.destroy()
+                return ""
+            }
+            // The process has exited, so EOF is imminent — join with a bound
+            // rather than assuming it, in case a grandchild kept the pipe open.
+            reader.join(1000)
+            synchronized(out) { out.toString().trim() }
         } catch (e: Exception) {
-            Log.w(TAG, "Fallback exec failed: ${e.message}")
+            Log.w(TAG, "Fallback output failed: ${e.message}")
+            try { proc?.destroy() } catch (_: Exception) {}
             ""
         }
     }
@@ -302,6 +386,8 @@ object RootShell {
         generation++
         workerThread?.takeIf { it != Thread.currentThread() }?.interrupt()
         workerThread = null
+        // Best-effort teardown of a shell we have already decided to drop;
+        // "Root shell destroyed" is logged below regardless.
         try { writer?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
         try { process?.destroy() } catch (_: Exception) {}
