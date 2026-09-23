@@ -721,7 +721,8 @@ class GatewayService : Service() {
                 smsId = id,
                 encoding = measured?.encoding ?: "",
                 parts = measured?.parts ?: 0,
-                status = "pending"
+                status = "pending",
+                subId = subId
             )
         )
         broadcastLog("SMS send: $id to $target accepted (${text.length} chars, sub=$subId)")
@@ -1320,7 +1321,11 @@ class GatewayService : Service() {
                         number = currentCallNumber,
                         timestamp = if (currentAttemptStart != 0L) currentAttemptStart
                                     else currentCallStart,
-                        durationSec = dur
+                        durationSec = dur,
+                        // No subId: the call path never resolves which
+                        // subscription it used, so it stays -1 rather than
+                        // claiming the default SIM.
+                        subId = -1
                     ))
                     currentCallStart = 0L
                     currentAttemptStart = 0L

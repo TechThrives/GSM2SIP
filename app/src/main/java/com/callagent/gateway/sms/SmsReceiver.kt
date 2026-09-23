@@ -73,7 +73,11 @@ class SmsReceiver : BroadcastReceiver() {
                 type = CallLogStore.TYPE_SMS,
                 text = text,
                 smsId = sms.id,
-                parts = parts.size
+                parts = parts.size,
+                // The subscription that received it: the only place this is
+                // knowable.  Dropped here and the detail sheet can only name
+                // the default SIM for both slots' messages.
+                subId = subId
             )
         )
         Log.i(TAG, "SMS from $sender (${parts.size} part(s), sub=$subId slot=$slot) queued as ${sms.id}")

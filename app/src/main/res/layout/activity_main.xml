@@ -212,6 +212,7 @@
                         android:layout_height="wrap_content"
                         android:orientation="vertical"
                         android:background="@drawable/card_bg"
+                        android:layout_marginTop="12dp"
                         android:padding="16dp"
                         android:visibility="gone">
 
@@ -779,91 +780,6 @@
 <!-- Bottom tab bar removed: navigation is the header menu on the home view -->
     </LinearLayout>
 
-    <!-- ═══ Full-screen in-call overlay (above everything, hidden by default) ═══ -->
-    <LinearLayout
-        android:id="@+id/inCallView"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:background="@color/background"
-        android:visibility="gone"
-        android:gravity="center_horizontal">
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <TextView
-            android:id="@+id/tvInCallStatus"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Calling..."
-            android:textSize="16sp"
-            android:textColor="@color/text_secondary" />
-
-        <TextView
-            android:id="@+id/tvInCallNumber"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textSize="32sp"
-            android:textColor="@color/text_primary"
-            android:fontFamily="monospace"
-            android:gravity="center"
-            android:paddingVertical="16dp"
-            android:paddingHorizontal="24dp"
-            android:maxLines="1"
-            android:autoSizeTextType="uniform"
-            android:autoSizeMinTextSize="18sp"
-            android:autoSizeMaxTextSize="32sp" />
-
-        <TextView
-            android:id="@+id/tvInCallTimer"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="00:00"
-            android:textSize="48sp"
-            android:textColor="@color/text_primary"
-            android:fontFamily="monospace"
-            android:paddingVertical="24dp"
-            android:visibility="gone" />
-
-        <View
-            android:layout_width="0dp"
-            android:layout_height="0dp"
-            android:layout_weight="1" />
-
-        <!-- Listen in on both sides through the speaker.  Does not touch the
-             microphone, which stays muted for the whole call. -->
-        <Button
-            android:id="@+id/btnInCallMonitor"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:layout_marginHorizontal="24dp"
-            android:layout_marginBottom="12dp"
-            android:text="LISTEN IN"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="#2563EB"
-            android:minHeight="0dp"
-            android:insetTop="0dp"
-            android:insetBottom="0dp" />
-
-        <Button
-            android:id="@+id/btnInCallEnd"
-            android:layout_width="match_parent"
-            android:layout_height="64dp"
-            android:layout_marginHorizontal="24dp"
-            android:layout_marginBottom="32dp"
-            android:text="END CALL"
-            android:textSize="20sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="#DC2626"
-            android:minHeight="0dp"
-            android:insetTop="0dp"
-            android:insetBottom="0dp" />
-    </LinearLayout>
-
 </FrameLayout>
+
+

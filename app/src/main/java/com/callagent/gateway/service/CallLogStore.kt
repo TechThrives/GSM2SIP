@@ -35,7 +35,12 @@ data class CallLogEntry(
      */
     val status: String = "",
     /** Failure detail, where there is one. */
-    val error: String = ""
+    val error: String = "",
+    /** The subscription this message travelled on; -1 when it is unknown —
+     *  a call never records one, and neither does a row written before the
+     *  log carried this field.  Display must not name a SIM from it when it
+     *  is -1: the default subscription is a guess, not an answer. */
+    val subId: Int = -1
 )
 
 object CallLogStore {
@@ -81,6 +86,7 @@ object CallLogStore {
             if (entry.smsc.isNotEmpty()) put("smsc", entry.smsc)
             if (entry.status.isNotEmpty()) put("status", entry.status)
             if (entry.error.isNotEmpty()) put("err", entry.error)
+            if (entry.subId >= 0) put("sub", entry.subId)
         }
         arr.put(obj)
         // Oldest first in storage, so trim from the front.
@@ -107,7 +113,8 @@ object CallLogStore {
                 parts = obj.optInt("parts", 0),
                 smsc = obj.optString("smsc", ""),
                 status = obj.optString("status", ""),
-                error = obj.optString("err", "")
+                error = obj.optString("err", ""),
+                subId = obj.optInt("sub", -1)
             )
         }.reversed() // newest first
         cachedEntries = entries
@@ -148,7 +155,8 @@ object CallLogStore {
                     parts = obj.optInt("parts", 0),
                     smsc = obj.optString("smsc", ""),
                     status = obj.optString("status", ""),
-                    error = obj.optString("err", "")
+                    error = obj.optString("err", ""),
+                    subId = obj.optInt("sub", -1)
                 )
             )
             obj.put("enc", updated.encoding)

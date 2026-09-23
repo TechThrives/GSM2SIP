@@ -77,9 +77,7 @@ class MainActivity : AppCompatActivity() {
 
     private val backCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
-            if (inCallOpen) {
-                return
-            } else if (currentTab == "logs") {
+            if (currentTab == "logs") {
                 switchTab("config")
             } else if (currentTab != "home") {
                 switchTab("home")
@@ -115,7 +113,6 @@ class MainActivity : AppCompatActivity() {
     private var callLogBuiltOut = false
 
     // Tab containers + bottom bar
-    private lateinit var tabbedRoot: LinearLayout
     private lateinit var tabHome: View
     private lateinit var tabConfig: View
     private lateinit var tvHomeStatusPill: TextView
@@ -154,13 +151,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabLogs: LinearLayout
     private var currentTab = ""
 
-    // In-call views
-    private lateinit var inCallView: LinearLayout
-    private lateinit var tvInCallStatus: TextView
-    private lateinit var tvInCallNumber: TextView
-    private lateinit var tvInCallTimer: TextView
-    private lateinit var btnInCallEnd: Button
-    private lateinit var btnInCallMonitor: Button
     private var monitoring = false
     /** True while a call is bridged, so SNOOP is only offered when it can work. */
     private var callLive = false
@@ -170,14 +160,10 @@ class MainActivity : AppCompatActivity() {
     /** Registration state as reported by the service, rather than guessed from
      *  the status text.  See GatewayService.broadcastStatus. */
     private var sipRegistered = false
-    private var inCallOpen = false
-    private var inCallOpenTime = 0L
-    private var viewBeforeInCall = "dialer"
     private var callStartTime = 0L
     /** When the service says the bridge came up.  Authoritative: the activity
      *  can be started, stopped and restarted several times during one call. */
     private var serviceCallStart = 0L
-    private var lastGsmPollState = -1
     private val callTimerHandler = Handler(Looper.getMainLooper())
     private val callTimerRunnable = object : Runnable {
         override fun run() {
@@ -191,7 +177,6 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     String.format("%02d:%02d", elapsed / 60, elapsed % 60)
                 }
-                tvInCallTimer.text = t
                 if (::tvHomeCallTimer.isInitialized) tvHomeCallTimer.text = t
                 // Tick on the second boundary of the call, not 1000ms after
                 // whenever this happened to run: a flat delay accumulates the
@@ -225,64 +210,8 @@ class MainActivity : AppCompatActivity() {
         callTimerRunnable.run()
     }
 
-    private val gsmPollRunnable = object : Runnable {
-        override fun run() {
-            if (!inCallOpen) return
-            val call = com.callagent.gateway.gsm.GsmCallManager.activeCall
-            val state = com.callagent.gateway.gsm.GsmCallManager.activeCallState
-            if (call != null && state != lastGsmPollState) {
-                lastGsmPollState = state
-                when (state) {
-                    android.telecom.Call.STATE_CONNECTING -> tvInCallStatus.text = "Calling..."
-                    android.telecom.Call.STATE_DIALING -> tvInCallStatus.text = "Ringing..."
-                    android.telecom.Call.STATE_RINGING -> tvInCallStatus.text = "Ringing..."
-                    android.telecom.Call.STATE_ACTIVE -> {
-                        if (running) {
-                            tvInCallStatus.text = "Connecting..."
-                        } else {
-                            tvInCallStatus.text = "Connected"
-                            if (callStartTime == 0L) {
-                                callStartTime = System.currentTimeMillis()
-                                tvInCallTimer.text = "00:00"
-                                tvInCallTimer.visibility = View.VISIBLE
-                                callTimerRunnable.run()
-                            }
-                        }
-                    }
-                    android.telecom.Call.STATE_DISCONNECTED -> {
-                        scheduleInCallClose()
-                        return
-                    }
-                }
-            } else if (call == null && lastGsmPollState != -1) {
-                // GSM call was seen by poll but is now gone — call ended
-                scheduleInCallClose()
-                return
-            } else if (call == null && lastGsmPollState == -1) {
-                // Never saw a GSM call — failed dial or slow setup
-                // Safety timeout to avoid stuck screen
-                if (System.currentTimeMillis() - inCallOpenTime > 8000) {
-                    closeInCallScreen()
-                    return
-                }
-            }
-            callTimerHandler.postDelayed(this, 500)
-        }
-    }
-
     private var running = false
     private var gsmCallActive = false
-    private var onlineSince = 0L
-
-    private val uptimeHandler = Handler(Looper.getMainLooper())
-    private val uptimeRunnable = object : Runnable {
-        override fun run() {
-            if (onlineSince > 0) {
-                val elapsed = (System.currentTimeMillis() - onlineSince) / 1000
-                uptimeHandler.postDelayed(this, 1000)
-            }
-        }
-    }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -294,16 +223,6 @@ class MainActivity : AppCompatActivity() {
                     serviceCallStart = intent.getLongExtra("call_start", 0L)
                     updateStatus(state, info)
 
-                    val newOnlineSince = intent.getLongExtra("online_since", 0L)
-                    if (newOnlineSince != onlineSince) {
-                        onlineSince = newOnlineSince
-                        uptimeHandler.removeCallbacks(uptimeRunnable)
-                        if (onlineSince > 0) {
-                            uptimeRunnable.run()
-                        } else {
-                        }
-                    }
-
                     val wasRunning = running
                     running = state != "STOPPED" && state != "ERROR"
 
@@ -313,27 +232,6 @@ class MainActivity : AppCompatActivity() {
                     )
                     if (callActive != gsmCallActive) {
                         gsmCallActive = callActive
-                    }
-
-                    // No pop-up on an incoming call: the home view's live call
-                    // card is the in-call UI now, and the old full-screen view
-                    // appearing over it was just confusing.
-
-                    if (inCallOpen) {
-                        when (state) {
-                            "GSM_DIALING" -> tvInCallStatus.text = "Calling..."
-                            "GSM_ANSWERED", "SIP_CALLING" -> tvInCallStatus.text = "Connecting..."
-                            "SIP_RINGING" -> tvInCallStatus.text = "Ringing..."
-                            "BRIDGED" -> {
-                                tvInCallStatus.text = "Connected"
-                                tvInCallTimer.visibility = View.VISIBLE
-                                startCallTimer()
-                            }
-                            "TEARING_DOWN" -> tvInCallStatus.text = "Ending..."
-                            "IDLE" -> {
-                                scheduleInCallClose()
-                            }
-                        }
                     }
 
                     appendLog("[$state] $info")
@@ -358,7 +256,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         // Tab containers
-        tabbedRoot = findViewById(R.id.tabbedRoot)
         tabHome = findViewById(R.id.tabHome)
         tabConfig = findViewById(R.id.tabConfig)
         findViewById<View>(R.id.btnConfigBack).setOnClickListener { switchTab("home") }
@@ -405,7 +302,7 @@ class MainActivity : AppCompatActivity() {
         }
         btnHomeMute.setOnClickListener { toggleAgentMute() }
         btnHomeSnoop.setOnClickListener { toggleMonitor() }
-        btnHomeEnd.setOnClickListener { endCallFromInCallScreen() }
+        btnHomeEnd.setOnClickListener { endCall() }
 
 
         // Named and versioned at the top of settings.  It is the first thing
@@ -430,16 +327,6 @@ class MainActivity : AppCompatActivity() {
         // away exactly the lines worth reading — the ones from before anyone
         // opened the app, which is when the gateway runs unattended.
         tvLog.text = ""
-
-        // In-call views
-        inCallView = findViewById(R.id.inCallView)
-        tvInCallStatus = findViewById(R.id.tvInCallStatus)
-        tvInCallNumber = findViewById(R.id.tvInCallNumber)
-        tvInCallTimer = findViewById(R.id.tvInCallTimer)
-        btnInCallEnd = findViewById(R.id.btnInCallEnd)
-        btnInCallEnd.setOnClickListener { endCallFromInCallScreen() }
-        btnInCallMonitor = findViewById(R.id.btnInCallMonitor)
-        btnInCallMonitor.setOnClickListener { toggleMonitor() }
 
         requestPermissions()
         requestBatteryOptimizationExemption()
@@ -498,7 +385,7 @@ class MainActivity : AppCompatActivity() {
     // ── Own number, per SIM ─────────────────────────────
 
     /** One active SIM, as Settings needs to describe it. */
-    private data class SimInfo(val slot: Int, val subId: Int, val caption: String)
+    private data class SimInfo(val slot: Int, val subId: Int, val carrier: String, val caption: String)
 
     /** Own-number fields on screen, paired with the SIM slot each belongs to.
      *  Slot -1 is the no-SIM-readable case, bound to the legacy key. */
@@ -511,32 +398,35 @@ class MainActivity : AppCompatActivity() {
      * Our number, for the two labels that show it: "Connected to …" on the
      * live-call card, and the From/To pair in the SMS detail sheet.
      *
-     * Neither caller knows which SIM it is looking at — CallLogEntry does not
-     * record a slot, and the live-call card does not ask the orchestrator
-     * which destination it actually dialled — so this can only name the
-     * **default** subscription: exact on a single SIM, an honest
-     * approximation on two.  It is a label and never a routing decision,
-     * which is why naming a SIM here is acceptable in a way it is not in
-     * CallOrchestrator, where guessing silently addresses the wrong DID.
-     *
-     * `own_number` is the legacy single key, read only when the default SIM's
-     * per-slot box and the SIM itself are both empty.  This build writes
-     * `own_number_slot_<slot>` instead and never deletes the legacy key, so it
-     * is present only where a previous install left it.
+     * [subId] names whose number to show; passing none means the default
+     * subscription — exact on one SIM, an approximation on two, and only ever
+     * a label: guessing is harmless here, not in CallOrchestrator where it
+     * addresses the wrong DID.  Chain is this subscription's platform value
+     * then `own_number_slot_<slot>`, with the legacy `own_number` key as last
+     * resort only when no subscription was named — a named SIM never borrows
+     * another's box, so a miss stays empty.
      */
     @SuppressLint("MissingPermission")
-    private fun ownNumberForDisplay(): String {
+    private fun ownNumberForDisplay(
+        subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    ): String {
+        val named = OwnNumber.isValidSubscription(subId)
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        // Whose box: the named subscription's, or the default one's when
+        // nothing was named.
         val slot = runCatching {
+            val forSub =
+                if (named) subId else SubscriptionManager.getDefaultSubscriptionId()
             getSystemService(SubscriptionManager::class.java)
-                ?.getActiveSubscriptionInfo(SubscriptionManager.getDefaultSubscriptionId())
-                ?.simSlotIndex
+                ?.getActiveSubscriptionInfo(forSub)?.simSlotIndex
         }.getOrNull()
         val fromBox = slot?.let { prefs.getString(ownNumberKey(it), "") }?.trim().orEmpty()
-        val fromSim = OwnNumber.fromSim(this, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-        return (fromSim ?: fromBox).ifEmpty {
-            prefs.getString("own_number", "")?.trim().orEmpty()
-        }
+        val own = OwnNumber.fromSim(this, subId) ?: fromBox
+        if (own.isNotEmpty()) return own
+        // Named and empty: stop.  The legacy key is the lowest slot's number,
+        // which for any other SIM is the confidently-wrong label this avoids.
+        if (named) return ""
+        return prefs.getString("own_number", "")?.trim().orEmpty()
     }
 
     /**
@@ -564,6 +454,7 @@ class MainActivity : AppCompatActivity() {
             SimInfo(
                 slot = slot,
                 subId = info.subscriptionId,
+                carrier = carrier,
                 caption = listOfNotNull(
                     "SIM ${slot + 1}",
                     carrier.ifEmpty { null },
@@ -874,10 +765,8 @@ class MainActivity : AppCompatActivity() {
             startCallTimer()
         } else {
             homeCallCard.visibility = View.GONE
-            if (!inCallOpen) {
-                callStartTime = 0L
-                callTimerHandler.removeCallbacks(callTimerRunnable)
-            }
+            callStartTime = 0L
+            callTimerHandler.removeCallbacks(callTimerRunnable)
             // Mute is per-call; do not carry it into the next one.
             if (agentMuted) {
                 agentMuted = false
@@ -1003,11 +892,17 @@ class MainActivity : AppCompatActivity() {
      */
     private fun showSmsDetails(entry: CallLogEntry) {
         val outgoing = entry.direction != "IN"
-        val own = ownNumberForDisplay()
 
         // A message still in flight has fresher paperwork in the outbox.
         val live = entry.smsId.takeIf { it.isNotEmpty() }
             ?.let { runCatching { SmsOutbox.get(this, it) }.getOrNull() }
+
+        // Whose SIM this was: the entry's own subscription, else the outbox's
+        // for a row written before the log carried one.  -1 leaves it unnamed,
+        // and an unnamed label must not name a SIM either.
+        val subId = if (entry.subId >= 0) entry.subId else live?.subId ?: -1
+        val own = ownNumberForDisplay(subId)
+        val sim = activeSims().firstOrNull { it.subId == subId }
 
         val parts = maxOf(entry.parts, live?.parts ?: 0)
         val status = entry.status.ifEmpty {
@@ -1030,6 +925,10 @@ class MainActivity : AppCompatActivity() {
 
         val header = StringBuilder()
             .append(row("Direction", if (outgoing) "Outgoing" else "Incoming"))
+            .append(row("SIM", sim?.let {
+                listOfNotNull("${it.slot + 1}", it.carrier.ifEmpty { null })
+                    .joinToString(" \u00b7 ")
+            } ?: ""))
             .append(row("From", if (outgoing) own else entry.number))
             .append(row("To", if (outgoing) entry.number else own))
             .append(row("SMSC", entry.smsc))
@@ -1446,26 +1345,6 @@ class MainActivity : AppCompatActivity() {
             svLog.post { svLog.fullScroll(ScrollView.FOCUS_DOWN) }
         }
 
-        if (onlineSince > 0) {
-            uptimeHandler.removeCallbacks(uptimeRunnable)
-            uptimeRunnable.run()
-        }
-
-        // The old full-screen in-call view is superseded by the live call
-        // card on the home view; it is no longer opened automatically.
-
-        if (inCallOpen) {
-            if (com.callagent.gateway.gsm.GsmCallManager.activeCall == null &&
-                System.currentTimeMillis() - inCallOpenTime > 2000) {
-                closeInCallScreen()
-            } else {
-                callTimerHandler.removeCallbacks(callTimerRunnable)
-                if (callStartTime > 0) callTimerRunnable.run()
-                callTimerHandler.removeCallbacks(gsmPollRunnable)
-                callTimerHandler.postDelayed(gsmPollRunnable, 500)
-            }
-        }
-
         // Refresh the traffic list if it is the visible one.  This used to be
         // guarded on the old Calls tab, so after that tab went the home list
         // stopped being refreshed here at all and showed a stale view until
@@ -1491,9 +1370,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        uptimeHandler.removeCallbacks(uptimeRunnable)
         callTimerHandler.removeCallbacks(callTimerRunnable)
-        callTimerHandler.removeCallbacks(gsmPollRunnable)
         netHandler.removeCallbacks(netRunnable)
         unregisterReceiver(statusReceiver)
     }
@@ -1529,18 +1406,7 @@ class MainActivity : AppCompatActivity() {
     /** Show the already-cached list for the current filter — runs on UI thread, no I/O */
     // ── Dialler ──────────────────────────────────────────
 
-    // ── In-Call Screen ───────────────────────────────────
-
-    private var inCallCloseScheduled = false
-
-    /** Show "Call ended" briefly then close the in-call screen */
-    private fun scheduleInCallClose() {
-        if (!inCallOpen || inCallCloseScheduled) return
-        inCallCloseScheduled = true
-        tvInCallStatus.text = "Call ended"
-        callTimerHandler.removeCallbacks(gsmPollRunnable)
-        callTimerHandler.postDelayed({ closeInCallScreen() }, 1500)
-    }
+    // ── Call controls ────────────────────────────────────
 
     /** Listen in on the live call through the speaker.  The microphone is not
      *  touched — it stays muted, so the room is never audible to either side. */
@@ -1555,9 +1421,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateMonitorButtons() {
-        if (::btnInCallMonitor.isInitialized) {
-            btnInCallMonitor.text = if (monitoring) "STOP LISTENING" else "LISTEN IN"
-        }
         if (::btnHomeSnoop.isInitialized) {
             setCallButtonState(
                 btnHomeSnoop,
@@ -1567,51 +1430,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openInCallScreen(number: String) {
-        inCallOpen = true
-        inCallOpenTime = System.currentTimeMillis()
-        inCallCloseScheduled = false
-        callStartTime = 0L
-        lastGsmPollState = -1
-        tvInCallNumber.text = number
-        tvInCallStatus.text = "Calling..."
-        tvInCallTimer.visibility = View.GONE
-        viewBeforeInCall = currentTab
-        // Hide tabs, show in-call overlay
-        tabbedRoot.visibility = View.GONE
-        inCallView.visibility = View.VISIBLE
-        callTimerHandler.removeCallbacks(gsmPollRunnable)
-        callTimerHandler.postDelayed(gsmPollRunnable, 500)
-    }
-
-    private fun closeInCallScreen() {
-        if (!inCallOpen) return
-        inCallOpen = false
-        // The monitor lives with the RTP session, which ends with the call, so
-        // only the button label needs resetting for the next one.
-        monitoring = false
-        updateMonitorButtons()
-        callTimerHandler.removeCallbacks(callTimerRunnable)
-        callTimerHandler.removeCallbacks(gsmPollRunnable)
-        callStartTime = 0L
-        lastGsmPollState = -1
-        inCallView.visibility = View.GONE
-        tabbedRoot.visibility = View.VISIBLE
-        gsmCallActive = false
-        // Refresh the traffic list on returning from a call, so the call that
-        // just ended is there.
-        if (currentTab == "home") {
-            refreshHome()
-        }
-    }
-
-    private fun endCallFromInCallScreen() {
-        val call = com.callagent.gateway.gsm.GsmCallManager.activeCall
-        if (call != null) {
-            tvInCallStatus.text = "Ending..."
+    /** END CALL on the home call card.  The card only exists while a call is
+     *  live, so this hangs up; there is no overlay left to dismiss. */
+    private fun endCall() {
+        if (com.callagent.gateway.gsm.GsmCallManager.activeCall != null) {
             com.callagent.gateway.gsm.GsmCallManager.hangupCall()
-        } else {
-            closeInCallScreen()
         }
     }
 
@@ -1677,29 +1500,6 @@ class MainActivity : AppCompatActivity() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("callagent log", logText))
         Toast.makeText(this, "Log copied to clipboard", Toast.LENGTH_SHORT).show()
-    }
-
-    // ── Helpers ──────────────────────────────────────────
-
-    private fun formatDuration(totalSeconds: Long): String {
-        val h = totalSeconds / 3600
-        val m = (totalSeconds % 3600) / 60
-        val s = totalSeconds % 60
-        return String.format("%02d:%02d:%02d", h, m, s)
-    }
-
-    private fun formatDurationCompact(totalSeconds: Long): String {
-        val h = totalSeconds / 3600
-        val m = (totalSeconds % 3600) / 60
-        val s = totalSeconds % 60
-        return if (h > 0) String.format("%d:%02d:%02d", h, m, s)
-        else String.format("%d:%02d", m, s)
-    }
-
-    private fun resolveThemeColor(attr: Int): Int {
-        val tv = android.util.TypedValue()
-        theme.resolveAttribute(attr, tv, true)
-        return ContextCompat.getColor(this, tv.resourceId)
     }
 
     // ── Permissions ─────────────────────────────────────
