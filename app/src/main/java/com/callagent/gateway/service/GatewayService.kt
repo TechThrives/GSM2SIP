@@ -1119,7 +1119,7 @@ class GatewayService : Service() {
         currentAttemptStart = 0L
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "callagent.pro") ?: ""
+        val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "") ?: ""
         val port = intent?.getIntExtra(EXTRA_PORT, 5060) ?: prefs.getInt("port", 5060)
         val username = intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "") ?: ""
         val password = intent?.getStringExtra(EXTRA_PASS) ?: prefs.getString("pass", "") ?: ""
@@ -1733,8 +1733,9 @@ class GatewayService : Service() {
             val pollMs = 3_000L
             val waitStart = System.currentTimeMillis()
             while (System.currentTimeMillis() - waitStart < maxWaitMs) {
-                // minSdk 31 >= API 29, so --uid is unconditional: appops set it
-                // per-package before Android 10, per-uid after.
+                // minSdk 31 >= API 29, so --uid is unconditional: the appops
+                // CLI only gained that flag in Android 10 — before it, only the
+                // package mode was addressable from the shell.
                 val uidProbe = "--uid "
                 val probe = RootShell.execForOutput(
                     "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
@@ -1770,7 +1771,7 @@ class GatewayService : Service() {
                 "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
             )
             val elapsed = System.currentTimeMillis() - t0
-            val allowed = result.contains("allow", ignoreCase = true)
+            val allowed = RootShell.recordAudioAllowed(result)
             Log.i(TAG, "appops RECORD_AUDIO: [$result] ok=$allowed (${elapsed}ms)")
             broadcastLog("appops RECORD_AUDIO: ok=$allowed (${elapsed}ms)")
 

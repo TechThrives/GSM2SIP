@@ -117,7 +117,7 @@ class SipClient(
             ?: Build.MODEL?.takeIf { it.isNotBlank() }
             ?: "unknown").trim().replace(Regex("\\s+"), "-")
         SipBuilder.userAgent =
-            "gsm2sip v${com.callagent.gateway.BuildConfig.VERSION_NAME} $handset"
+            "GSM2SIP v${com.callagent.gateway.BuildConfig.VERSION_NAME} $handset"
         callIdBase = "${System.currentTimeMillis() / 1000}@$publicIp"
         createSocket()
 

@@ -70,6 +70,26 @@ object RootShell {
         else -> "unavailable"
     }
 
+    /**
+     * True only if RECORD_AUDIO is really allowed.
+     * Checks "Uid mode:" first — it overrides the "RECORD_AUDIO:" package line.
+     * Old output.contains("allow") could see package allow while Uid was
+     * ignore, skipping the grant while capture stayed denied.
+     */
+    fun recordAudioAllowed(output: String): Boolean {
+        for (line in output.lines()) {
+            if (line.trim().startsWith("Uid mode:")) {
+                return line.contains("allow", ignoreCase = true)
+            }
+        }
+        for (line in output.lines()) {
+            if (line.trim().startsWith("RECORD_AUDIO:")) {
+                return line.contains("allow", ignoreCase = true)
+            }
+        }
+        return output.contains("allow", ignoreCase = true)
+    }
+
     private fun reportDenied(detail: String) {
         if (denied) return
         denied = true

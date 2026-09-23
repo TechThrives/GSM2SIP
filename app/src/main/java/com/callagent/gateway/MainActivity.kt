@@ -506,7 +506,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun openConfigView() {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        findViewById<EditText>(R.id.etCfgServer).setText(prefs.getString("server", "callagent.pro"))
+        findViewById<EditText>(R.id.etCfgServer).setText(prefs.getString("server", ""))
         findViewById<EditText>(R.id.etCfgPort).setText(prefs.getInt("port", 5060).toString())
         findViewById<EditText>(R.id.etCfgUser).setText(prefs.getString("user", ""))
         findViewById<EditText>(R.id.etCfgPass).setText(prefs.getString("pass", ""))

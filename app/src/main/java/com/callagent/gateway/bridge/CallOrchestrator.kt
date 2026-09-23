@@ -1093,8 +1093,9 @@ class CallOrchestrator(
     private fun forceAllowRecordAudio() {
         try {
             val pkg = context.packageName
-            // minSdk 31 >= API 29, so --uid is unconditional: appops set it
-            // per-package before Android 10, per-uid after.
+            // minSdk 31 >= API 29, so --uid is unconditional: the appops
+            // CLI only gained that flag in Android 10 — before it, only the
+            // package mode was addressable from the shell.
             val uidProbe = "--uid "
             // This sits directly between the call being answered and the first
             // frame of audio, so ask before acting: one `appops get` costs a
@@ -1105,7 +1106,7 @@ class CallOrchestrator(
             val probe = RootShell.execForOutput(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
-            if (probe.contains("allow", ignoreCase = true)) {
+            if (RootShell.recordAudioAllowed(probe)) {
                 Log.i(TAG, "appops RECORD_AUDIO already allow — skipping grant")
                 return
             }
@@ -1128,7 +1129,7 @@ class CallOrchestrator(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             val elapsed = System.currentTimeMillis() - t0
-            val allowed = result.contains("allow", ignoreCase = true)
+            val allowed = RootShell.recordAudioAllowed(result)
             Log.i(TAG, "appops RECORD_AUDIO: [$result] ok=$allowed (${elapsed}ms)")
 
             if (!allowed) {

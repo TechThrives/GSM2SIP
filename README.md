@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="icon.png" width="128" alt="gsm2sip">
+  <img src="icon.png" width="128" alt="GSM2SIP">
 </p>
 
-<h1 align="center">gsm2sip</h1>
+<h1 align="center">GSM2SIP</h1>
 
 <p align="center">
 Bridges Android phone to any SIP server as GSM Gateway
@@ -123,7 +123,7 @@ That is why the gateway moved to a Qualcomm device.
 ## Download
 
 Prebuilt APK and Magisk module:
-**[github.com/pulpoff/gsm2sip/releases](https://github.com/pulpoff/gsm2sip/releases)**
+**[github.com/TechThrives/GSM2SIP/releases](https://github.com/TechThrives/GSM2SIP/releases)**
 
 Install the Magisk module — it carries the APK as a privileged system app.
 Building from source is only needed to change something; see below.
@@ -153,7 +153,7 @@ Only the Magisk module needs to be installed — it includes the APK and handles
 
 1. **Install Magisk module**: Copy `gateway-magisk.zip` to device, install via Magisk Manager → Modules
 2. **Reboot** the device — the module installs the APK as a privileged system app and grants all permissions on boot
-3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → gsm2sip
+3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → GSM2SIP
 4. **Configure SIP**: open Settings in the app (the gear, top right) and enter
    your SIP server address, port, username and password
 5. **Own Number**: Enter the SIM's own number in international format, e.g.
@@ -178,7 +178,7 @@ keyed on it is what decides where the call goes.
 
 ## Quick start with callagent.pro
 
-Once installed, you can use gsm2sip instantly with a free
+Once installed, you can use GSM2SIP instantly with a free
 [callagent.pro](https://callagent.pro) registration. The account is a SIP
 server that already knows how this gateway addresses calls and messages, so
 there is nothing to write on the server side:

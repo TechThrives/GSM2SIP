@@ -1750,8 +1750,9 @@ class RtpSession(
     private fun reAssertAppOps() {
         try {
             val pkg = context.packageName
-            // minSdk 31 >= API 29, so --uid is unconditional: appops set it
-            // per-package before Android 10, per-uid after.
+            // minSdk 31 >= API 29, so --uid is unconditional: the appops
+            // CLI only gained that flag in Android 10 — before it, only the
+            // package mode was addressable from the shell.
             val uidProbe = "--uid "
             // Ask before acting.  The sequence below is eight root commands,
             // two of them killing PermissionController, and pm/appops/cmd each
@@ -1763,7 +1764,7 @@ class RtpSession(
             val probe = RootShell.execForOutput(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
-            if (probe.contains("allow", ignoreCase = true)) {
+            if (RootShell.recordAudioAllowed(probe)) {
                 Log.d(TAG, "appops RECORD_AUDIO still allow — nothing to do")
                 return
             }
@@ -1790,7 +1791,7 @@ class RtpSession(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             val elapsed = System.currentTimeMillis() - t0
-            val allowed = result.contains("allow", ignoreCase = true)
+            val allowed = RootShell.recordAudioAllowed(result)
             Log.i(TAG, "appops re-assert: [$result] ok=$allowed (${elapsed}ms)")
 
             if (!allowed) {

@@ -110,8 +110,9 @@ class BootReceiver : BroadcastReceiver() {
                 val maxWaitMs = 90_000L
                 val pollMs = 3_000L
                 val waitStart = System.currentTimeMillis()
-                // minSdk 31 >= API 29, so --uid is unconditional: appops set it
-                // per-package before Android 10, per-uid after.
+                // minSdk 31 >= API 29, so --uid is unconditional: the appops
+                // CLI only gained that flag in Android 10 — before it, only the
+                // package mode was addressable from the shell.
                 val uidFlag = "--uid "
                 while (System.currentTimeMillis() - waitStart < maxWaitMs) {
                     val probe = RootShell.execForOutput(
@@ -141,7 +142,7 @@ class BootReceiver : BroadcastReceiver() {
                     "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
                 )
                 val elapsed = System.currentTimeMillis() - t0
-                val allowed = result.contains("allow", ignoreCase = true)
+                val allowed = RootShell.recordAudioAllowed(result)
                 Log.i(TAG, "Early RECORD_AUDIO: [$result] ok=$allowed (${elapsed}ms)")
 
                 if (!allowed) {

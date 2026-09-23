@@ -17,7 +17,7 @@
         android:id="@+id/etSipServer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="sip.callagent.pro"
+        android:hint="sip.example.com"
         android:textColor="@color/text_primary"
         android:textColorHint="@color/text_hint"
         android:background="@drawable/input_bg"

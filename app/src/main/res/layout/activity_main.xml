@@ -449,13 +449,13 @@
                             android:layout_gravity="center_horizontal"
                             android:layout_marginTop="14dp"
                             android:src="@mipmap/ic_launcher"
-                            android:contentDescription="gsm2sip" />
+                            android:contentDescription="GSM2SIP" />
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:gravity="center_horizontal"
-                            android:text="gsm2sip"
+                            android:text="GSM2SIP"
                             android:textSize="16sp"
                             android:textStyle="bold"
                             android:textColor="@color/text_primary"
@@ -473,7 +473,7 @@
 
                         <TextView style="@style/CfgLabel" android:text="SIP Server" />
                         <EditText android:id="@+id/etCfgServer" style="@style/CfgField"
-                            android:hint="callagent.pro" android:inputType="textUri" />
+                            android:hint="sip.example.com" android:inputType="textUri" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Port" />
                         <EditText android:id="@+id/etCfgPort" style="@style/CfgField"
