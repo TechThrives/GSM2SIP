@@ -479,8 +479,12 @@ class CallOrchestrator(
     // ── SipClient.Listener ──────────────────────────────
 
     override fun onRegistered() {
-        Log.i(TAG, "SIP registered — ready for calls")
-        listener?.onStateChanged(BridgeState.IDLE, "SIP registered")
+        if (bridgeState == BridgeState.IDLE) {
+            Log.i(TAG, "SIP registered — ready for calls")
+            listener?.onStateChanged(BridgeState.IDLE, "SIP registered")
+        } else {
+            Log.i(TAG, "SIP registered — keeping active call state $bridgeState")
+        }
     }
 
     override fun onRegistrationFailed() {

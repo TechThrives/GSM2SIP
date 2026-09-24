@@ -320,6 +320,13 @@ class SipClient(
             return
         }
 
+        // CANCEL can arrive after the call object is gone; still answer it.
+        if (msg.isRequest && msg.method == "CANCEL") {
+            sendTo(SipBuilder.statusResponse(msg, 200, "OK"), address)
+            callId?.let { activeCalls.remove(it) }
+            return
+        }
+
         // New INVITE
         if (msg.isRequest && msg.method == "INVITE") {
             handleIncomingInvite(msg, address)
@@ -778,20 +785,11 @@ class SipClient(
                         }
                     }
 
-                    // The registration refresh is the only SIP request this
-                    // gateway makes while idle.  It is authenticated, it is
-                    // exactly what a registrar expects, and it doubles as the
-                    // liveness check — so there is nothing left for OPTIONS to
-                    // do.  Polling with OPTIONS every 15s meant 240
-                    // unauthenticated requests an hour, each answered 401 and
-                    // recorded as an auth failure, which is the pattern
-                    // fail2ban counts; it banned this gateway's IP repeatedly.
+                    // Refresh REGISTER so the AOR stays valid after an Asterisk restart.
                     if (System.currentTimeMillis() - lastRegisterTime > REREGISTER_INTERVAL_MS) {
                         uiLog("Refreshing registration")
-                        registered = false
                         if (!register()) {
-                            // Failed refresh means the server or the path is
-                            // gone; the retry loop above takes over from here.
+                            registered = false
                             keepaliveFailures++
                             if (keepaliveFailures >= MAX_KEEPALIVE_FAILURES) {
                                 uiLog("Registration refresh failed $keepaliveFailures times")
@@ -847,18 +845,17 @@ class SipClient(
         /**
          * How often to refresh the registration.
          *
-         * The REGISTER advertises `expires=3600` and the server grants it --
-         * verified against callagent.pro, whose 200 OK carries `Expires: 3600`
-         * (chan_sip's default).  Half the granted lifetime is the conventional
-         * refresh point: it leaves a full 30 minutes to notice a failure and
-         * retry before the binding actually lapses.
+         * Asterisk can restart without notifying the UDP client, and the
+         * configured maximum expiration is 120 seconds. Refresh every 60
+         * seconds so the contact is restored within one polling cycle and a
+         * failed refresh is detected promptly.
          *
-         * The previous ten minutes was not derived from anything the server
-         * said -- nothing here reads the granted expiry -- and refreshed six
-         * times an hour where twice will do.  Each refresh is challenged, so
-         * it also put six 401s an hour in the registrar's auth log per device.
+         * The interval intentionally does not rely on the 3600-second
+         * expiration advertised by the original registrar. This gateway is a
+         * single local endpoint, so frequent authenticated refreshes avoid a
+         * stale contact without depending on an old 30-minute assumption.
          */
-        private const val REREGISTER_INTERVAL_MS = 30 * 60 * 1000L
+        private const val REREGISTER_INTERVAL_MS = 60 * 1000L
 
         /**
          * How often to refresh the NAT binding.

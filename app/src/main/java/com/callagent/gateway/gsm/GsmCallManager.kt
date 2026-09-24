@@ -10,10 +10,12 @@ import android.os.Handler
 import android.os.Looper
 import android.telecom.Call
 import android.telecom.DisconnectCause
+import android.telecom.PhoneAccountHandle
 import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.telecom.TelecomManager
 import android.telephony.TelephonyManager
+import android.telephony.SubscriptionManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
@@ -323,7 +325,23 @@ object GsmCallManager {
         val uri = Uri.fromParts("tel", destination, null)
         try {
             val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            telecom.placeCall(uri, Bundle())
+            val accounts = telecom.callCapablePhoneAccounts
+            val defaultSubId = SubscriptionManager.getDefaultSubscriptionId()
+            val handle: PhoneAccountHandle? =
+                telecom.getDefaultOutgoingPhoneAccount(context.packageName)
+                    ?: accounts?.firstOrNull { it.id.toString() == defaultSubId.toString() }
+                    ?: accounts?.firstOrNull()
+            val extras = Bundle().apply {
+                if (handle != null) {
+                    putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+                }
+            }
+            Log.i(
+                TAG,
+                "Telecom account=${handle?.id ?: "none"} " +
+                    "(available=${accounts?.size ?: 0}, defaultSub=$defaultSubId)"
+            )
+            telecom.placeCall(uri, extras)
             return
         } catch (e: Exception) {
             Log.w(TAG, "placeCall failed (${e.message}) — falling back to ACTION_CALL")

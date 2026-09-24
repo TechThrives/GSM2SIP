@@ -194,6 +194,24 @@ class SipCall(
                 return true
             }
 
+            // CANCEL: acknowledge the request and stop the pending call.
+            msg.isRequest && msg.method == "CANCEL" -> {
+                Log.i(TAG, "Received CANCEL for call $callId")
+                sipClient.sendResponse(
+                    SipBuilder.statusResponse(msg, 200, "OK"),
+                    remoteContactAddress ?: sipClient.serverAddress
+                )
+                originalInvite?.let { invite ->
+                    sipClient.sendResponse(
+                        SipBuilder.reject(invite, 487, "Request Terminated", localTag),
+                        remoteContactAddress ?: sipClient.serverAddress
+                    )
+                }
+                state = State.TERMINATED
+                listener?.onCallTerminated(this)
+                return true
+            }
+
             // Incoming BYE
             msg.isRequest && msg.method == "BYE" -> {
                 Log.i(TAG, "Received BYE for call $callId")

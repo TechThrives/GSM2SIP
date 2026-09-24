@@ -52,6 +52,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
 import com.callagent.gateway.sms.SmsOutbox
@@ -751,17 +752,15 @@ class MainActivity : AppCompatActivity() {
         tvHomeSrtpBadge.visibility =
             if (tlsOn && cfg.getBoolean("srtp_enabled", false)) View.VISIBLE else View.GONE
 
-        if (state == "BRIDGED") {
+        val callVisible =
+            state == "BRIDGED" && GsmCallManager.isCallActive
+        if (callVisible) {
             homeCallCard.visibility = View.VISIBLE
             val number = com.callagent.gateway.gsm.GsmCallManager.currentNumber ?: info
             tvHomeCallFrom.text = number
             val dest = ownNumberForDisplay()
             tvHomeCallTo.text = if (dest.isNotEmpty()) "Connected to $dest" else "Connected"
-            // Inbound is the normal direction for a gateway; a dialler-initiated
-            // call is the other way round.
-            tvHomeCallDirection.text =
-                if (com.callagent.gateway.gsm.GsmCallManager.activeCallState ==
-                    android.telecom.Call.STATE_ACTIVE && gsmCallActive) "GSM → SIP" else "GSM → SIP"
+            tvHomeCallDirection.text = "GSM → SIP"
             startCallTimer()
         } else {
             homeCallCard.visibility = View.GONE
