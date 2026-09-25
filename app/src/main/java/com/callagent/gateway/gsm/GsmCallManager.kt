@@ -2,7 +2,6 @@ package com.callagent.gateway.gsm
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
@@ -18,6 +17,7 @@ import android.telephony.TelephonyManager
 import android.telephony.SubscriptionManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
+import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.RootShell
 
 /**
@@ -112,7 +112,7 @@ object GsmCallManager {
         // one call's own disconnect.
         endedCall = null
 
-        val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+        val number = call.details?.handle?.schemeSpecificPart.orEmpty()
 
         // Same API 31 migration as the assignment above: getState() only ever
         // forwarded to Details, so read it there directly.
@@ -191,7 +191,7 @@ object GsmCallManager {
                 // Handle calls that arrive as STATE_NEW in onCallAdded and
                 // transition to RINGING via the callback.  Without this,
                 // the orchestrator never learns about the incoming call.
-                val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+                val number = call.details?.handle?.schemeSpecificPart.orEmpty()
                 Log.i(TAG, "GSM call ringing: $number (via state change)")
                 listener?.onIncomingGsmCall(call, number)
             }
@@ -255,8 +255,8 @@ object GsmCallManager {
      * Activity, and we hold CALL_PHONE (plus CALL_PRIVILEGED as a priv-app);
      * as the default dialer, Telecom hands the call back to our InCallService.
      *
-     * The ACTION_CALL path is kept as a fallback for the case where Telecom
-     * refuses the direct call — it still works whenever an Activity is up.
+     * A failed placeCall is reported to the caller; no generic ACTION_CALL
+     * fallback is used because it cannot carry the selected Telecom account.
      */
     /**
      * True for dial strings that are MMI/USSD codes rather than phone numbers
@@ -320,38 +320,82 @@ object GsmCallManager {
     }
 
     @SuppressLint("MissingPermission")
-    fun makeCall(context: Context, destination: String) {
-        Log.i(TAG, "Making GSM call to $destination")
-        val uri = Uri.fromParts("tel", destination, null)
+    private fun phoneAccountForSubscription(
+        context: Context,
+        telecom: TelecomManager,
+        accounts: List<PhoneAccountHandle>,
+        subId: Int,
+        sourceNumber: String
+    ): PhoneAccountHandle? {
+        accounts.firstOrNull { it.id.toString() == subId.toString() }?.let {
+            Log.i(TAG, "Telecom account '${it.id}' matches subscription $subId directly")
+            return it
+        }
+
+        val subMgr = context.getSystemService(SubscriptionManager::class.java)
+        val info = subMgr?.getActiveSubscriptionInfo(subId)
+        val iccDigits = info?.iccId?.filter(Char::isDigit)
+        accounts.firstOrNull { account ->
+            val idDigits = account.id?.filter(Char::isDigit)
+            !iccDigits.isNullOrEmpty() && idDigits == iccDigits
+        }?.let {
+            Log.i(TAG, "Telecom account '${it.id}' matches subscription $subId by ICCID")
+            return it
+        }
+
+        accounts.firstOrNull { account ->
+            val address = telecom.getPhoneAccount(account)?.address?.schemeSpecificPart
+            !address.isNullOrBlank() && OwnNumber.subscriptionIdForNumber(context, address) == subId
+        }?.let {
+            Log.i(TAG, "Telecom account '${it.id}' matches subscription $subId by number")
+            return it
+        }
+
+        Log.e(TAG, "No Telecom account for subscription $subId (source=$sourceNumber)")
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun makeCall(
+        context: Context,
+        toNumber: String,
+        fromNumber: String
+    ): Boolean {
+        Log.i(TAG, "Making GSM call to $toNumber from $fromNumber")
+        val uri = Uri.fromParts("tel", toNumber, null)
         try {
             val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
             val accounts = telecom.callCapablePhoneAccounts
-            val defaultSubId = SubscriptionManager.getDefaultSubscriptionId()
-            val handle: PhoneAccountHandle? =
-                telecom.getDefaultOutgoingPhoneAccount(context.packageName)
-                    ?: accounts?.firstOrNull { it.id.toString() == defaultSubId.toString() }
-                    ?: accounts?.firstOrNull()
+            val requestedSubId = OwnNumber.subscriptionIdForNumber(context, fromNumber)
+            if (requestedSubId == null) {
+                Log.e(TAG, "No SIM matches source number $fromNumber")
+                return false
+            }
+            val subId = requestedSubId
+            val handle = phoneAccountForSubscription(
+                context = context,
+                telecom = telecom,
+                accounts = accounts.orEmpty(),
+                subId = subId,
+                sourceNumber = fromNumber
+            )
+            if (handle == null) {
+                Log.e(TAG, "No Telecom account for source subscription $requestedSubId")
+                return false
+            }
             val extras = Bundle().apply {
-                if (handle != null) {
-                    putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-                }
+                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
             }
             Log.i(
                 TAG,
-                "Telecom account=${handle?.id ?: "none"} " +
-                    "(available=${accounts?.size ?: 0}, defaultSub=$defaultSubId)"
+                "Telecom account=${handle.id} " +
+                    "(requestedSub=$requestedSubId, available=${accounts?.size ?: 0})"
             )
             telecom.placeCall(uri, extras)
-            return
+            return true
         } catch (e: Exception) {
-            Log.w(TAG, "placeCall failed (${e.message}) — falling back to ACTION_CALL")
-        }
-        try {
-            context.startActivity(
-                Intent(Intent.ACTION_CALL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "ACTION_CALL fallback failed: ${e.message}")
+            Log.e(TAG, "placeCall failed (${e.message})")
+            return false
         }
     }
 

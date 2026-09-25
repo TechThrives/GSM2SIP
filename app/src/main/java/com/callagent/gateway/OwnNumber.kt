@@ -3,6 +3,7 @@ package com.callagent.gateway
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
+import android.telephony.PhoneNumberUtils
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -75,12 +76,107 @@ object OwnNumber {
         null
     }
 
+    /** Resolve a source number to one active subscription. */
+    @SuppressLint("MissingPermission")
+    fun subscriptionIdForNumber(context: Context, number: String): Int? {
+        val matches = subscriptions(context).filter { info ->
+            val own = numberForSubscriptionId(context, info.subscriptionId)
+            val target = normalizeNumber(context, number, info.subscriptionId)
+            own != null && target != null && numbersMatch(
+                target = target,
+                candidate = normalizeNumber(context, own, info.subscriptionId)
+            )
+        }
+
+        return when (matches.size) {
+            1 -> matches.single().subscriptionId
+            0 -> {
+                Log.w(TAG, "No SIM matches source number $number")
+                null
+            }
+            else -> {
+                Log.w(TAG, "Source number $number matches ${matches.size} SIMs")
+                null
+            }
+        }
+    }
+
+    private fun numbersMatch(target: String, candidate: String?): Boolean {
+        if (candidate == null) return false
+        val targetDigits = target.filter(Char::isDigit)
+        val candidateDigits = candidate.filter(Char::isDigit)
+        val targetNational = targetDigits.trimStart('0').ifEmpty { targetDigits }
+        val candidateNational = candidateDigits.trimStart('0').ifEmpty { candidateDigits }
+        return targetDigits.isNotEmpty() && candidateDigits.isNotEmpty() &&
+            (targetDigits == candidateDigits ||
+                candidateDigits == targetNational ||
+                targetDigits == candidateNational ||
+                targetDigits.endsWith(candidateNational) ||
+                candidateDigits.endsWith(targetNational))
+    }
+
+    private fun normalizeNumber(
+        context: Context,
+        number: String,
+        subId: Int?
+    ): String? {
+        val trimmed = number.trim().filterNot { it in " -/" }
+        if (trimmed.startsWith("+")) return trimmed.filter(Char::isDigit)
+        if (trimmed.startsWith("00")) {
+            return trimmed.removePrefix("00").filter(Char::isDigit).ifEmpty { null }
+        }
+
+        val iso = subId?.let {
+            runCatching {
+                val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                if (isValidSubscription(it)) {
+                    base.createForSubscriptionId(it).simCountryIso
+                } else {
+                    base.simCountryIso
+                }
+            }.getOrNull()
+        }?.uppercase()?.ifEmpty { null }
+
+        return if (iso != null) {
+            PhoneNumberUtils.formatNumberToE164(trimmed, iso)
+                ?.filter(Char::isDigit)
+                ?.ifEmpty { null }
+        } else {
+            trimmed.filter(Char::isDigit).ifEmpty { null }
+        }
+    }
+
+    /** Return the configured/platform number for one subscription. */
+    fun numberForSubscriptionId(context: Context, subId: Int): String? {
+        val subscription = if (isValidSubscription(subId)) {
+            subId
+        } else {
+            SubscriptionManager.getDefaultSubscriptionId()
+        }
+        val slot = runCatching {
+            context.getSystemService(SubscriptionManager::class.java)
+                ?.getActiveSubscriptionInfo(subscription)
+                ?.simSlotIndex
+        }.getOrNull()
+        return fromSim(context, subscription)
+            ?: slot?.let {
+                context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+                    .getString("own_number_slot_$it", "")
+                    ?.trim()
+                    ?.ifEmpty { null }
+            }
+    }
+
+    private fun subscriptions(context: Context) =
+        context.getSystemService(SubscriptionManager::class.java)
+            ?.activeSubscriptionInfoList
+            .orEmpty()
+
     /**
-     * Is [subId] a subscription we can actually ask about?
+     * Whether [subId] identifies a subscription that can be queried.
      *
-     * [SubscriptionManager.INVALID_SUBSCRIPTION_ID] and the negative sentinels
-     * callers pass when they had no SIM to name are not: those mean "ask about
-     * the default subscription" rather than "ask about this one".
+     * The invalid and negative sentinel values mean "ask about the default
+     * subscription" rather than naming a specific SIM.
      */
     fun isValidSubscription(subId: Int): Boolean =
         subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID &&

@@ -177,9 +177,13 @@ class SipMessage private constructor(
             }
             .toList()
 
-    /** Check for custom gateway header: X-GSM-Forward */
-    val gsmForwardNumber: String?
-        get() = header("x-gsm-forward")?.trim()
+    /** GSM source number from X-GSM-From. */
+    val fromNumber: String
+        get() = header("x-gsm-from")?.trim().orEmpty()
+
+    /** GSM destination number from X-GSM-To. */
+    val toNumber: String
+        get() = header("x-gsm-to")?.trim().orEmpty()
 
     /** Serialize this message back to a SIP packet string */
     fun encode(): String {
@@ -300,13 +304,10 @@ object SipBuilder {
         callId: String, cseq: Int,
         localRtpPort: Int,
         fromTag: String = tag(),
-        callerIdNumber: String? = null,
-        callerIdName: String? = null,
         auth: String? = null,
-        srtp: SrtpKeys? = null
+        srtp: SrtpKeys? = null,
+        extraHeaders: List<String> = emptyList()
     ): String {
-        val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
-        val fromUser = callerIdNumber ?: username
         val sdp = buildSdp(localIp, localRtpPort, srtp)
         return buildString {
             append("INVITE $targetUri SIP/2.0\r\n")
@@ -314,11 +315,12 @@ object SipBuilder {
             append("Max-Forwards: 70\r\n")
             append("User-Agent: $userAgent\r\n")
             append("To: <$targetUri>\r\n")
-            append("From: $fromDisplay<sip:$fromUser@$domain>;tag=$fromTag\r\n")
+            append("From: <sip:$username@$domain>;tag=$fromTag\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $cseq INVITE\r\n")
             append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
             if (auth != null) append(auth)
+            extraHeaders.forEach { append(it).append("\r\n") }
             append("Content-Type: application/sdp\r\n")
             append("Content-Length: ${sdp.length}\r\n\r\n")
             append(sdp)

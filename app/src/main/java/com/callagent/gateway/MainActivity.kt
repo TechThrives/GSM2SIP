@@ -388,24 +388,17 @@ class MainActivity : AppCompatActivity() {
     /** One active SIM, as Settings needs to describe it. */
     private data class SimInfo(val slot: Int, val subId: Int, val carrier: String, val caption: String)
 
-    /** Own-number fields on screen, paired with the SIM slot each belongs to.
-     *  Slot -1 is the no-SIM-readable case, bound to the legacy key. */
     private val ownNumberFields = mutableListOf<Pair<Int, EditText>>()
 
-    private fun ownNumberKey(slot: Int) =
-        if (slot < 0) "own_number" else "own_number_slot_$slot"
+    private fun ownNumberKey(slot: Int) = "own_number_slot_$slot"
 
     /**
      * Our number, for the two labels that show it: "Connected to …" on the
      * live-call card, and the From/To pair in the SMS detail sheet.
      *
      * [subId] names whose number to show; passing none means the default
-     * subscription — exact on one SIM, an approximation on two, and only ever
-     * a label: guessing is harmless here, not in CallOrchestrator where it
-     * addresses the wrong DID.  Chain is this subscription's platform value
-     * then `own_number_slot_<slot>`, with the legacy `own_number` key as last
-     * resort only when no subscription was named — a named SIM never borrows
-     * another's box, so a miss stays empty.
+     * subscription.  Chain is this subscription's platform value then
+     * `own_number_slot_<slot>`. Each SIM must resolve to its own number.
      */
     @SuppressLint("MissingPermission")
     private fun ownNumberForDisplay(
@@ -413,21 +406,14 @@ class MainActivity : AppCompatActivity() {
     ): String {
         val named = OwnNumber.isValidSubscription(subId)
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        // Whose box: the named subscription's, or the default one's when
-        // nothing was named.
+        val forSub =
+            if (named) subId else SubscriptionManager.getDefaultSubscriptionId()
         val slot = runCatching {
-            val forSub =
-                if (named) subId else SubscriptionManager.getDefaultSubscriptionId()
             getSystemService(SubscriptionManager::class.java)
                 ?.getActiveSubscriptionInfo(forSub)?.simSlotIndex
         }.getOrNull()
         val fromBox = slot?.let { prefs.getString(ownNumberKey(it), "") }?.trim().orEmpty()
-        val own = OwnNumber.fromSim(this, subId) ?: fromBox
-        if (own.isNotEmpty()) return own
-        // Named and empty: stop.  The legacy key is the lowest slot's number,
-        // which for any other SIM is the confidently-wrong label this avoids.
-        if (named) return ""
-        return prefs.getString("own_number", "")?.trim().orEmpty()
+        return OwnNumber.fromSim(this, forSub) ?: fromBox
     }
 
     /**
@@ -475,30 +461,14 @@ class MainActivity : AppCompatActivity() {
 
         val sims = activeSims()
         if (sims.isEmpty()) {
-            // Nothing readable — still offer one field on the legacy key, so a
-            // device that will not describe its SIMs stays configurable.
-            val row = layoutInflater.inflate(R.layout.item_sim_number, container, false)
-            val et = row.findViewById<EditText>(R.id.etSimNumber)
-            et.setText(prefs.getString("own_number", ""))
-            row.findViewById<TextView>(R.id.tvSimCaption).text = "No active SIM detected"
-            container.addView(row)
-            ownNumberFields += -1 to et
             return
         }
 
-        val lowest = sims.first().slot
         for (sim in sims) {
             val row = layoutInflater.inflate(R.layout.item_sim_number, container, false)
             val et = row.findViewById<EditText>(R.id.etSimNumber)
             val stored = prefs.getString(ownNumberKey(sim.slot), "").orEmpty()
-            // First run after upgrading there are no per-slot values yet; the
-            // one legacy number belongs to whichever SIM was in use, so offer
-            // it on the lowest active slot rather than making it be retyped.
-            et.setText(
-                stored.ifEmpty {
-                    if (sim.slot == lowest) prefs.getString("own_number", "").orEmpty() else ""
-                }
-            )
+            et.setText(stored)
             row.findViewById<TextView>(R.id.tvSimCaption).text = sim.caption
             container.addView(row)
             ownNumberFields += sim.slot to et
@@ -637,8 +607,6 @@ class MainActivity : AppCompatActivity() {
         val port = findViewById<EditText>(R.id.etCfgPort).text.toString().trim().toIntOrNull() ?: 5060
         val user = findViewById<EditText>(R.id.etCfgUser).text.toString().trim()
         val pass = findViewById<EditText>(R.id.etCfgPass).text.toString().trim()
-        // The lowest active SIM's number is the one everything that does not
-        // know which SIM it is dealing with will use.
         val own = ownNumberFields.firstOrNull()?.second?.text?.toString()?.trim().orEmpty()
         val auto = findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked
         val useStun = findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked
@@ -663,11 +631,7 @@ class MainActivity : AppCompatActivity() {
             .putInt("port", port)
             .putString("user", user)
             .putString("pass", pass)
-            // Writes `own_number_slot_<slot>` per field; when no SIM is
-            // readable the single field sits at slot -1, ownNumberKey(-1) is
-            // `own_number`, and that device keeps its one key.  `own` is never
-            // mirrored into `own_number` — routing reads the per-slot keys
-            // only (see OwnNumber).
+            // Writes one `own_number_slot_<slot>` value per active SIM.
             .also { ed ->
                 ownNumberFields.forEach { (slot, et) ->
                     ed.putString(ownNumberKey(slot), et.text.toString().trim())

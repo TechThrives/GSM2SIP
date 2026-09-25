@@ -510,8 +510,8 @@ class SipClient(
         call.negotiatedPayloadType = msg.sdpPreferredPayloadType
         Log.i(TAG, "Incoming INVITE codec: pt=${call.negotiatedPayloadType} codecs=${msg.sdpCodecs}")
 
-        // Check for GSM-forward header
-        call.gsmForwardNumber = msg.gsmForwardNumber
+        call.fromNumber = msg.fromNumber
+        call.toNumber = msg.toNumber
 
         activeCalls[callId] = call
         listener?.onIncomingCall(call)
@@ -523,17 +523,13 @@ class SipClient(
     fun makeCall(
         targetExtension: String,
         localRtpPort: Int,
-        callerIdNumber: String? = null,
-        callerIdName: String? = null
+        extraHeaders: List<String> = emptyList()
     ): SipCall {
         val callId = "${System.currentTimeMillis()}call@$publicIp"
         val call = SipCall(callId, SipCall.Direction.OUTBOUND, this)
+        call.extraHeaders = extraHeaders
         call.localRtpPort = localRtpPort
-        call.outboundCallerIdNumber = callerIdNumber
-        call.outboundCallerIdName = callerIdName
-        val fromUser = callerIdNumber ?: username
-        val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
-        call.fromHeader = "$fromDisplay<sip:$fromUser@$serverDomain>;tag=${call.localTag}"
+        call.fromHeader = "<sip:$username@$serverDomain>;tag=${call.localTag}"
         call.toHeader = "<sip:$targetExtension@$serverDomain>"
 
         // Generated once, here, and reused for every retry and re-INVITE of
@@ -548,16 +544,15 @@ class SipClient(
             callId, call.localCseq++,
             localRtpPort,
             fromTag = call.localTag,
-            callerIdNumber = callerIdNumber,
-            callerIdName = callerIdName,
-            srtp = call.localSrtpKeys
+            srtp = call.localSrtpKeys,
+            extraHeaders = extraHeaders
         )
 
         activeCalls[callId] = call
         sendTo(invite, serverAddress)
         // Log both halves the server routes on: the Request-URI it turns into
         // EXTEN, and the From user it turns into caller ID.
-        Log.i(TAG, "Sent INVITE RURI=$targetUri From=<sip:$fromUser@$serverDomain> (call-id=$callId)")
+        Log.i(TAG, "Sent INVITE RURI=$targetUri From=<sip:$username@$serverDomain> (call-id=$callId)")
 
         // RFC 3261 Timer A: retransmit INVITE over UDP until any response is received.
         // Intervals: 500ms, 1s, 2s, 4s (capped at T2=4s). Stops immediately when
@@ -694,10 +689,9 @@ class SipClient(
             call.callId, call.localCseq++,
             call.localRtpPort,
             fromTag = call.localTag,
-            callerIdNumber = call.outboundCallerIdNumber,
-            callerIdName = call.outboundCallerIdName,
             auth = auth,
-            srtp = call.localSrtpKeys
+            srtp = call.localSrtpKeys,
+            extraHeaders = call.extraHeaders
         )
         sendTo(invite, serverAddress)
     }

@@ -88,12 +88,13 @@ class SipCall(
     // Caller info (for inbound and outbound caller-ID)
     var callerNumber: String? = null
     var callerDisplayName: String? = null
-    // Outbound caller-ID (preserved for auth re-INVITE)
-    var outboundCallerIdNumber: String? = null
-    var outboundCallerIdName: String? = null
 
-    // GSM forward target (for outbound from server)
-    var gsmForwardNumber: String? = null
+    // GSM source and destination numbers
+    var fromNumber: String = ""
+    var toNumber: String = ""
+
+    // Custom headers must survive an authenticated INVITE retry.
+    var extraHeaders: List<String> = emptyList()
 
     // Original INVITE (for building responses)
     var originalInvite: SipMessage? = null

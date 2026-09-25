@@ -16,7 +16,7 @@ class GsmCallService : InCallService() {
 
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
-        val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+        val number = call.details?.handle?.schemeSpecificPart.orEmpty()
         // Call.getState() was deprecated in API 31 — exactly this app's minSdk —
         // in favour of Call.Details.getState(), which is where it read from
         // anyway.  The handle two lines up already treats a null Details as
