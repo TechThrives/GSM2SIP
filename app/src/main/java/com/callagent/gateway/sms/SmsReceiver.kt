@@ -33,7 +33,7 @@ class SmsReceiver : BroadcastReceiver() {
         if (parts.isEmpty()) return
 
         // A long SMS arrives as several PDUs of one message, in order.
-        val sender = parts[0].displayOriginatingAddress ?: parts[0].originatingAddress ?: ""
+        val rawSender = parts[0].displayOriginatingAddress ?: parts[0].originatingAddress ?: ""
         val text = parts.joinToString("") { it.displayMessageBody ?: it.messageBody ?: "" }
         val receivedAt = parts[0].timestampMillis
 
@@ -43,10 +43,20 @@ class SmsReceiver : BroadcastReceiver() {
             SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX,
             intent.getIntExtra("subscription", SubscriptionManager.INVALID_SUBSCRIPTION_ID)
         )
-        val (slot, carrier, ownNumber) = describeSim(context, subId)
+        val sender = OwnNumber.toE164(context, rawSender, subId)
+        val (slot, carrier, _) = describeSim(context, subId)
+        val ownNumber = OwnNumber.numberForSubscriptionId(context, subId).orEmpty()
+        if (sender == null || !OwnNumber.isE164(ownNumber)) {
+            Log.w(
+                TAG,
+                "SMS not forwarded: sender='$rawSender' and SIM number='$ownNumber' " +
+                    "could not be normalized to +E.164 (sub=$subId)"
+            )
+            return
+        }
 
-        val sms = PendingSms(
-            id = SmsStore.newId(),
+        val sms = InboundSms(
+            id = SmsInbox.newId(),
             from = sender,
             to = ownNumber,
             text = text,
@@ -59,7 +69,7 @@ class SmsReceiver : BroadcastReceiver() {
 
         // Written to disk before anything is attempted: this broadcast is the
         // only copy of the message we will ever get.
-        SmsStore.add(context, sms)
+        SmsInbox.add(context, sms)
         // On arrival, not on forward: the message happened whether or not the
         // server is reachable, and the traffic list is a record of what the
         // gateway saw.
@@ -74,9 +84,9 @@ class SmsReceiver : BroadcastReceiver() {
                 text = text,
                 smsId = sms.id,
                 parts = parts.size,
-                // The subscription that received it: the only place this is
-                // knowable.  Dropped here and the detail sheet can only name
-                // the default SIM for both slots' messages.
+                status = "pending",
+                // Keep the receiving subscription for the detail sheet so
+                // dual-SIM SMS rows are shown against the correct SIM.
                 subId = subId
             )
         )
@@ -114,8 +124,9 @@ class SmsReceiver : BroadcastReceiver() {
             )
         } catch (e: Exception) {
             // Reading subscription details needs READ_PHONE_STATE, and the
-            // MSISDN is often simply not on the SIM.  Neither is a reason to
-            // drop the message — the server can route on the sender alone.
+            // MSISDN is often simply not on the SIM. The message is still
+            // rejected when no valid receiving number can be resolved because
+            // X-SMS-To is mandatory.
             Log.w(TAG, "SIM details unavailable for sub=$subId: ${e.message}")
             Triple(-1, "", "")
         }

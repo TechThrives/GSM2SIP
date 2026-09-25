@@ -15,10 +15,13 @@ data class OutboundSms(
     val id: String,
     val to: String,
     val text: String,
+    /** X-SMS-From: the SIM number the message is sent from. */
+    val from: String = "",
     val subId: Int,
     val parts: Int = 0,
     val createdAt: Long = System.currentTimeMillis(),
     val dispatched: Boolean = false,
+    val dispatchedAt: Long = 0L,
     val sentOk: Int = 0,
     val sentFailed: Int = 0,
     val lastError: String = "",
@@ -52,6 +55,7 @@ object SmsOutbox {
     /** Entries older than this are given up on — a delivery report that has
      *  not arrived within a day is not going to. */
     private const val EXPIRY_MS = 24L * 60 * 60 * 1000
+    private const val STALE_DISPATCH_CLAIM_MS = 10L * 60 * 1000
 
     @Synchronized
     fun add(context: Context, sms: OutboundSms) {
@@ -90,8 +94,14 @@ object SmsOutbox {
     fun claimForDispatch(context: Context, id: String): Boolean {
         val all = read(context).toMutableList()
         val i = all.indexOfFirst { it.id == id }
-        if (i < 0 || all[i].dispatched) return false
-        all[i] = all[i].copy(dispatched = true)
+        if (i < 0) return false
+        val current = all[i]
+        val now = System.currentTimeMillis()
+        if (current.dispatched &&
+            current.dispatchedAt > 0 &&
+            now - current.dispatchedAt < STALE_DISPATCH_CLAIM_MS
+        ) return false
+        all[i] = current.copy(dispatched = true, dispatchedAt = now)
         write(context, all)
         return true
     }
@@ -124,8 +134,10 @@ object SmsOutbox {
     }
 
     private fun toJson(s: OutboundSms) = JSONObject().apply {
-        put("id", s.id); put("to", s.to); put("text", s.text); put("sub", s.subId)
+        put("id", s.id); put("to", s.to); put("from", s.from); put("text", s.text)
+        put("sub", s.subId)
         put("parts", s.parts); put("created", s.createdAt); put("dispatched", s.dispatched)
+        put("dispatchedAt", s.dispatchedAt)
         put("sentOk", s.sentOk); put("sentFailed", s.sentFailed); put("err", s.lastError)
         put("delOk", s.deliveredOk); put("delFailed", s.deliveredFailed)
         put("status", s.status); put("smsc", s.smsc); put("encoding", s.encoding)
@@ -136,10 +148,12 @@ object SmsOutbox {
         id = o.getString("id"),
         to = o.optString("to"),
         text = o.optString("text"),
+        from = o.optString("from"),
         subId = o.optInt("sub", -1),
         parts = o.optInt("parts"),
         createdAt = o.optLong("created"),
         dispatched = o.optBoolean("dispatched"),
+        dispatchedAt = o.optLong("dispatchedAt"),
         sentOk = o.optInt("sentOk"),
         sentFailed = o.optInt("sentFailed"),
         lastError = o.optString("err"),

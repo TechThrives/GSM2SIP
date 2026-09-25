@@ -4,9 +4,7 @@ import android.content.Context
 import android.telecom.Call
 import android.telecom.DisconnectCause
 import android.telecom.TelecomManager
-import android.telephony.PhoneNumberUtils
 import android.telephony.SubscriptionManager
-import android.telephony.TelephonyManager
 import android.util.Log
 import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.RootShell
@@ -62,7 +60,6 @@ class CallOrchestrator(
     @Volatile private var activeRtpSession: RtpSession? = null
     @Volatile private var activeSipCall: SipCall? = null
     @Volatile private var activeGsmCall: Call? = null
-    @Volatile private var diallerInitiated = false
     @Volatile private var lastStateChangeTime = 0L
 
     // Pending RTP info: saved when SIP answers before GSM is picked up.
@@ -83,13 +80,9 @@ class CallOrchestrator(
      * Start a fresh SIP-retry allowance for a new call attempt.
      *
      * [sipCallRetries] used to be zeroed only in [onIncomingGsmCall], but the
-     * counter gates [onCallTerminated]'s retry path, which is also reachable
-     * from the dialler-initiated flow — and that flow never passes through
-     * onIncomingGsmCall.  Once an earlier inbound call had burned through
-     * MAX_SIP_RETRIES, every later dialler call started with the counter
-     * already exhausted and got zero retries on its first SIP failure, until
-     * the process restarted.  Called from each place a call attempt begins,
-     * plus the teardown paths so no attempt can inherit another's allowance.
+     * counter also gates [onCallTerminated]'s retry path. Called from every
+     * place a call attempt begins, plus the teardown paths, so no attempt can
+     * inherit another attempt's allowance.
      */
     private fun resetSipRetries(reason: String) {
         if (sipCallRetries != 0) {
@@ -239,10 +232,7 @@ class CallOrchestrator(
             return it
         }
 
-        val active = runCatching {
-            context.getSystemService(SubscriptionManager::class.java)
-                ?.activeSubscriptionInfoList
-        }.getOrNull().orEmpty()
+        val active = OwnNumber.activeSubscriptions(context)
 
         // 2. A build that names the account after its ICCID.  A subscription
         //    id is a small int, so an 18-22 digit run can only be a card
@@ -334,28 +324,7 @@ class CallOrchestrator(
     private fun toInternational(
         number: String,
         subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID
-    ): String {
-        val trimmed = number.trim().filterNot { it == ' ' || it == '-' || it == '/' }
-        if (trimmed.startsWith("+")) return trimmed
-        if (trimmed.startsWith("00")) return "+" + trimmed.substring(2)
-        val iso = try {
-            val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            val scoped = if (OwnNumber.isValidSubscription(subId)) {
-                runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
-            } else {
-                base
-            }
-            scoped.simCountryIso?.uppercase()?.ifEmpty { null }
-        } catch (e: Exception) {
-            Log.w(TAG, "SIM country unavailable: ${e.message}")
-            null
-        }
-        if (iso != null) {
-            PhoneNumberUtils.formatNumberToE164(trimmed, iso)?.let { return it }
-        }
-        Log.w(TAG, "Cannot make '$trimmed' international (SIM country=$iso) — sending as is")
-        return trimmed
-    }
+    ): String = OwnNumber.toE164(context, number, subId).orEmpty()
 
     /** Cut the agent's audio to the caller, leaving the call itself up. */
     fun setAgentMuted(on: Boolean) {
@@ -379,63 +348,6 @@ class CallOrchestrator(
             return
         }
         session.setMonitorEnabled(on)
-    }
-
-    /** Initiate an outgoing GSM call from the dialler, then bridge to SIP */
-    fun initiateDiallerCall(toNumber: String) {
-        // MMI/USSD is not a call — it never produces a Telecom Connection, so
-        // arming the bridge for it would strand us in GSM_DIALING until the
-        // stale-state timeout.
-        if (GsmCallManager.isMmiCode(toNumber)) {
-            Log.i(TAG, "MMI code $toNumber — sending as USSD, not bridging")
-            GsmCallManager.sendMmi(context, toNumber) { result ->
-                Log.i(TAG, "MMI result: $result")
-                listener?.onStateChanged(bridgeState, "MMI: $result")
-            }
-            return
-        }
-        if (bridgeState != BridgeState.IDLE) {
-            // Check for stale state: if bridge has been non-IDLE for too long
-            // without reaching BRIDGED, force a reset.  This happens on cold boot
-            // when InCallService isn't bound yet and call events never arrive.
-            val staleMs = System.currentTimeMillis() - lastStateChangeTime
-            if (staleMs > STALE_STATE_TIMEOUT_MS) {
-                Log.w(TAG, "Bridge stuck in $bridgeState for ${staleMs/1000}s — force resetting")
-                forceReset("Stale state: $bridgeState for ${staleMs/1000}s")
-            } else {
-                Log.w(TAG, "Busy ($bridgeState) — cannot dial from dialler")
-                listener?.onError("Busy — cannot dial")
-                return
-            }
-        }
-        val fromNumber = OwnNumber.numberForSubscriptionId(context, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-        if (fromNumber.isNullOrBlank()) {
-            listener?.onError("No source SIM number available for dialler call")
-            return
-        }
-        Log.i(TAG, "Dialler-initiated call to $toNumber from $fromNumber")
-        // The dialler path reaches onCallTerminated without ever passing
-        // through onIncomingGsmCall, so it has to reset the counter itself —
-        // otherwise a previous inbound call that used up its retries leaves
-        // this one with none.
-        resetSipRetries("dialler call to $toNumber")
-        diallerInitiated = true
-        lastStateChangeTime = System.currentTimeMillis()
-        bridgeState = BridgeState.GSM_DIALING
-        listener?.onStateChanged(bridgeState, "Dialing $toNumber")
-        if (!GsmCallManager.makeCall(context, toNumber, fromNumber)) {
-            tearDown("Dialler GSM source SIM/account unavailable")
-        }
-
-        // Timeout: if GSM doesn't go active within 45s, tear down.
-        // On cold boot, InCallService may not be bound, so call events
-        // never arrive and the bridge gets stuck in GSM_DIALING.
-        schedule(GSM_DIAL_TIMEOUT_MS) {
-            if (bridgeState == BridgeState.GSM_DIALING) {
-                Log.w(TAG, "GSM dial timeout — no call events in ${GSM_DIAL_TIMEOUT_MS / 1000}s")
-                tearDown("GSM dial timeout")
-            }
-        }
     }
 
     // ── SipClient.Listener ──────────────────────────────
@@ -471,7 +383,7 @@ class CallOrchestrator(
 
         val toNumber = call.toNumber
         val fromNumber = call.fromNumber
-        if (toNumber.isNotEmpty() && fromNumber.isNotEmpty()) {
+        if (OwnNumber.isE164(toNumber) && OwnNumber.isE164(fromNumber)) {
             // OUTBOUND flow: Asterisk wants us to dial a GSM number.
             handleOutboundFlow(call, toNumber, fromNumber)
         } else {
@@ -483,9 +395,6 @@ class CallOrchestrator(
             sipClient.removeCall(call.callId)
         }
     }
-
-    private fun gatewayPrefs(context: Context) =
-        context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
 
     private fun digitsOf(value: String): String = value.filter { it.isDigit() }
 
@@ -580,34 +489,26 @@ class CallOrchestrator(
                 }
             }
             BridgeState.GSM_DIALING -> {
-                if (diallerInitiated) {
-                    // DIALLER flow: GSM active → place SIP call to Asterisk (like inbound)
-                    diallerInitiated = false
-                    bridgeState = BridgeState.GSM_ANSWERED
-                    listener?.onStateChanged(bridgeState, "GSM answered, calling Asterisk")
-                    Thread({ handleInboundFlow(call) }, "SIP-OutCall").start()
-                } else {
-                    // SIP-initiated OUTBOUND flow: GSM destination answered → start audio bridge
-                    bridgeState = BridgeState.BRIDGED
-                    listener?.onStateChanged(bridgeState, "Bridged (outbound)")
+                // SIP-initiated OUTBOUND flow: GSM destination answered -> start audio bridge
+                bridgeState = BridgeState.BRIDGED
+                listener?.onStateChanged(bridgeState, "Bridged (outbound)")
 
-                    // Answer the SIP call off the main thread
-                    Thread({
-                        activeSipCall?.let { sipCall ->
-                            val rtpPort = allocateRtpPort()
-                            sipCall.listener = this
-                            sipCall.accept(rtpPort)
+                // Answer the SIP call off the main thread
+                Thread({
+                    activeSipCall?.let { sipCall ->
+                        val rtpPort = allocateRtpPort()
+                        sipCall.listener = this
+                        sipCall.accept(rtpPort)
 
-                            val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
-                            val port = sipCall.remoteRtpPort
-                            val pt = sipCall.negotiatedPayloadType
-                            if (port > 0) {
-                                startRtp(rtpPort, addr, port, pt)
-                            }
+                        val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
+                        val port = sipCall.remoteRtpPort
+                        val pt = sipCall.negotiatedPayloadType
+                        if (port > 0) {
+                            startRtp(rtpPort, addr, port, pt)
                         }
-                        Log.i(TAG, "Outbound bridge established")
-                    }, "SIP-Bridge").start()
-                }
+                    }
+                    Log.i(TAG, "Outbound bridge established")
+                }, "SIP-Bridge").start()
             }
             else -> {}
         }
@@ -688,38 +589,17 @@ class CallOrchestrator(
         Log.i(TAG, "RTP ready: $remoteRtpAddr:$remoteRtpPort codec=$codecName bridgeState=$bridgeState")
 
         if (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING) {
-            // Check if GSM is already active (dialler-initiated calls).
-            // For inbound calls GSM is still ringing — answer it and wait for
-            // onGsmCallActive to start RTP.  For dialler calls GSM is already
-            // active so onGsmCallActive won't fire again — start RTP now.
-            val gsmAlreadyActive = GsmCallManager.isCallActive
+            // INBOUND flow: SIP/agent answered — save RTP info and answer GSM.
+            // When GSM goes active (onGsmCallActive), RTP starts immediately
+            // so the caller hears the agent from the first moment.
+            pendingRtpAddr = remoteRtpAddr
+            pendingRtpPort = remoteRtpPort
+            pendingPayloadType = payloadType
+            pendingLocalRtpPort = call.localRtpPort
 
-            if (gsmAlreadyActive) {
-                Log.i(TAG, "SIP answered (codec=$codecName) — GSM already active, starting RTP now")
-                val localRtpPort = call.localRtpPort
-                Thread({
-                    startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)
-                    if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
-                        Log.w(TAG, "Bridge torn down during RTP setup — not transitioning to BRIDGED")
-                        return@Thread
-                    }
-                    bridgeState = BridgeState.BRIDGED
-                    listener?.onStateChanged(bridgeState, "Bridged (dialler)")
-                    Log.i(TAG, "Dialler bridge established (codec=$codecName)")
-                }, "RTP-Start").start()
-            } else {
-                // INBOUND flow: SIP/agent answered — save RTP info and answer GSM.
-                // When GSM goes active (onGsmCallActive), RTP starts immediately
-                // so the caller hears the agent from the first moment.
-                pendingRtpAddr = remoteRtpAddr
-                pendingRtpPort = remoteRtpPort
-                pendingPayloadType = payloadType
-                pendingLocalRtpPort = call.localRtpPort
-
-                Log.i(TAG, "SIP answered (codec=$codecName) — answering GSM call now")
-                activeGsmCall?.let { GsmCallManager.answerCall(it) }
-                    ?: Log.e(TAG, "SIP answered but no active GSM call to answer!")
-            }
+            Log.i(TAG, "SIP answered (codec=$codecName) — answering GSM call now")
+            activeGsmCall?.let { GsmCallManager.answerCall(it) }
+                ?: Log.e(TAG, "SIP answered but no active GSM call to answer!")
         } else if (bridgeState == BridgeState.GSM_ANSWERED) {
             // Edge case: GSM was already answered (e.g. user picked up manually)
             // before SIP was ready.  Start RTP now.
@@ -742,10 +622,11 @@ class CallOrchestrator(
     // ── Inbound flow (GSM → SIP) ───────────────────────
 
     private fun handleInboundFlow(gsmCall: Call) {
-        val callerNumber = gsmCall.details?.handle?.schemeSpecificPart.orEmpty()
-        // The SIM that is actually ringing decides the DID we announce, not
-        // whichever SIM the platform happens to call default.
+        val rawCallerNumber = gsmCall.details?.handle?.schemeSpecificPart.orEmpty()
+        // The SIM that is actually ringing decides both the caller's country
+        // for E.164 normalization and the DID announced to Asterisk.
         val subId = subscriptionIdFor(gsmCall)
+        val callerNumber = toInternational(rawCallerNumber, subId)
         val toNumber = OwnNumber.numberForSubscriptionId(context, subId).orEmpty()
         if (!OwnNumber.isValidSubscription(subId) || callerNumber.isBlank() || toNumber.isBlank()) {
             Log.w(
@@ -891,7 +772,6 @@ class CallOrchestrator(
     private fun tearDown(reason: String, sipStatus: Pair<Int, String>? = null) {
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
         bridgeState = BridgeState.TEARING_DOWN
-        diallerInitiated = false
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
@@ -1073,7 +953,6 @@ class CallOrchestrator(
         }
         activeGsmCall = null
         pendingRtpAddr = null
-        diallerInitiated = false
         bridgeState = BridgeState.IDLE
         generation++
         lastStateChangeTime = System.currentTimeMillis()
@@ -1085,7 +964,6 @@ class CallOrchestrator(
     companion object {
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
-        private const val GSM_DIAL_TIMEOUT_MS = 45_000L
         /** If bridge is non-IDLE for this long, consider it stale */
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
 

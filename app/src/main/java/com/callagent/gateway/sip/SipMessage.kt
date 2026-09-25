@@ -21,9 +21,6 @@ class SipMessage private constructor(
     val statusCode: Int?
         get() = if (isResponse) startLine.split(" ").getOrNull(1)?.toIntOrNull() else null
 
-    val requestUri: String?
-        get() = if (isRequest) startLine.split(" ").getOrNull(1) else null
-
     fun header(name: String): String? =
         headers[name.lowercase()]
 
@@ -51,7 +48,6 @@ class SipMessage private constructor(
     }
 
     val callerNumber: String? get() = from?.let { extractUser(it) }
-    val dialedNumber: String? get() = to?.let { extractUser(it) }
 
     /** Extract display name from From header, e.g. "Display" <sip:...> */
     val callerDisplayName: String?

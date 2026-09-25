@@ -1,12 +1,16 @@
 package com.callagent.gateway
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.telephony.PhoneNumberUtils
+import android.telephony.SubscriptionInfo
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 
 /**
  * The gateway's own number as the *platform* reports it, for one subscription.
@@ -34,6 +38,44 @@ import android.util.Log
 object OwnNumber {
 
     private const val TAG = "OwnNumber"
+
+    /** Active subscriptions, or an empty list when phone-state access is absent. */
+    fun activeSubscriptions(context: Context): List<SubscriptionInfo> {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "READ_PHONE_STATE is not granted; cannot enumerate subscriptions")
+            return emptyList()
+        }
+        return runCatching {
+            context.getSystemService(SubscriptionManager::class.java)
+                ?.activeSubscriptionInfoList
+                .orEmpty()
+        }.getOrElse {
+            Log.w(TAG, "Could not enumerate subscriptions: ${it.message}")
+            emptyList()
+        }
+    }
+
+    /** SIM slot for a subscription, or null when it cannot be queried. */
+    fun simSlotForSubscription(context: Context, subId: Int): Int? {
+        val subscription = if (isValidSubscription(subId)) {
+            subId
+        } else {
+            SubscriptionManager.getDefaultSubscriptionId()
+        }
+        if (!isValidSubscription(subscription) ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return null
+        }
+        return runCatching {
+            context.getSystemService(SubscriptionManager::class.java)
+                ?.getActiveSubscriptionInfo(subscription)
+                ?.simSlotIndex
+        }.getOrNull()
+    }
 
     /**
      * The MSISDN the platform publishes for [subId], or null when it publishes
@@ -70,10 +112,48 @@ object OwnNumber {
             } else base
             scoped.line1Number
         }
-        number?.trim()?.ifEmpty { null }
+        number?.let { toE164(context, it, subId) }
     } catch (e: Exception) {
         Log.w(TAG, "SIM number unavailable: ${e.message}")
         null
+    }
+
+    private val E164 = Regex("^\\+[1-9][0-9]{7,14}$")
+
+    fun isE164(number: String): Boolean = E164.matches(number.trim())
+
+    /**
+     * Convert national, spaced, 00-prefixed, or already international input to
+     * strict +E.164 using the selected SIM's country. Returns null rather than
+     * forwarding an ambiguous value when the platform cannot normalize it.
+     */
+    fun toE164(
+        context: Context,
+        number: String,
+        subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    ): String? {
+        val trimmed = number.trim().filterNot { it in " -/()" }
+        if (isE164(trimmed)) return trimmed
+        val international = if (trimmed.startsWith("00") && trimmed.length > 4) {
+            "+${trimmed.drop(2).filter(Char::isDigit)}"
+        } else {
+            trimmed
+        }
+        if (isE164(international)) return international
+        if (trimmed.isEmpty() || trimmed.any { !it.isDigit() && it != '+' }) return null
+
+        val iso = runCatching {
+            val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            val scoped = if (isValidSubscription(subId)) {
+                runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
+            } else {
+                base
+            }
+            scoped.simCountryIso?.uppercase()?.ifEmpty { null }
+        }.getOrNull()
+        if (iso == null) return null
+        return PhoneNumberUtils.formatNumberToE164(trimmed, iso)
+            ?.takeIf(::isE164)
     }
 
     /** Resolve a source number to one active subscription. */
@@ -119,32 +199,7 @@ object OwnNumber {
         context: Context,
         number: String,
         subId: Int?
-    ): String? {
-        val trimmed = number.trim().filterNot { it in " -/" }
-        if (trimmed.startsWith("+")) return trimmed.filter(Char::isDigit)
-        if (trimmed.startsWith("00")) {
-            return trimmed.removePrefix("00").filter(Char::isDigit).ifEmpty { null }
-        }
-
-        val iso = subId?.let {
-            runCatching {
-                val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-                if (isValidSubscription(it)) {
-                    base.createForSubscriptionId(it).simCountryIso
-                } else {
-                    base.simCountryIso
-                }
-            }.getOrNull()
-        }?.uppercase()?.ifEmpty { null }
-
-        return if (iso != null) {
-            PhoneNumberUtils.formatNumberToE164(trimmed, iso)
-                ?.filter(Char::isDigit)
-                ?.ifEmpty { null }
-        } else {
-            trimmed.filter(Char::isDigit).ifEmpty { null }
-        }
-    }
+    ): String? = toE164(context, number, subId ?: SubscriptionManager.INVALID_SUBSCRIPTION_ID)
 
     /** Return the configured/platform number for one subscription. */
     fun numberForSubscriptionId(context: Context, subId: Int): String? {
@@ -153,24 +208,16 @@ object OwnNumber {
         } else {
             SubscriptionManager.getDefaultSubscriptionId()
         }
-        val slot = runCatching {
-            context.getSystemService(SubscriptionManager::class.java)
-                ?.getActiveSubscriptionInfo(subscription)
-                ?.simSlotIndex
-        }.getOrNull()
+        val slot = simSlotForSubscription(context, subscription)
         return fromSim(context, subscription)
             ?: slot?.let {
                 context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
                     .getString("own_number_slot_$it", "")
-                    ?.trim()
-                    ?.ifEmpty { null }
+                    ?.let { configured -> toE164(context, configured, subscription) }
             }
     }
 
-    private fun subscriptions(context: Context) =
-        context.getSystemService(SubscriptionManager::class.java)
-            ?.activeSubscriptionInfoList
-            .orEmpty()
+    private fun subscriptions(context: Context) = activeSubscriptions(context)
 
     /**
      * Whether [subId] identifies a subscription that can be queried.

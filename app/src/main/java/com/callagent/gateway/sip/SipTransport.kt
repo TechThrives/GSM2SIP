@@ -1,6 +1,7 @@
 package com.callagent.gateway.sip
 
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.DatagramPacket
@@ -138,11 +139,11 @@ class TlsSipTransport(
     private var output: OutputStream? = null
 
     /**
-     * Bytes read but not yet consumed as a message.  A single read can return
-     * half a message or three of them; this is what makes the difference
-     * invisible to the caller.
+     * Bytes read but not yet consumed as a message. Keep bytes until a complete
+     * SIP message is framed; decoding each read independently corrupts split
+     * UTF-8 characters and makes Content-Length byte counts incomparable.
      */
-    private val pending = StringBuilder()
+    private val pending = ByteArrayOutputStream()
 
     override val isOpen: Boolean
         get() = socket?.let { it.isConnected && !it.isClosed } == true
@@ -191,7 +192,7 @@ class TlsSipTransport(
         socket = s
         input = s.inputStream
         output = s.outputStream
-        pending.setLength(0)
+        pending.reset()
         log("TLS connected to $host:$port (${s.session.protocol}, ${s.session.cipherSuite})")
     }
 
@@ -218,7 +219,7 @@ class TlsSipTransport(
                 // caller reconnects rather than spinning on a dead stream.
                 throw java.io.EOFException("TLS connection closed by server")
             }
-            pending.append(String(buf, 0, n, Charsets.UTF_8))
+            pending.write(buf, 0, n)
             takeMessage()?.let { it to peer }
         } catch (_: SocketTimeoutException) {
             null
@@ -234,28 +235,39 @@ class TlsSipTransport(
      * body, which here means every SDP offer and every inbound SMS.
      */
     private fun takeMessage(): String? {
-        while (true) {
-            // RFC 5626 keepalives are bare CRLFs between messages.  They are
-            // not messages and must not be parsed as one.
-            var start = 0
-            while (start < pending.length &&
-                (pending[start] == '\r' || pending[start] == '\n')
-            ) start++
-            if (start > 0) pending.delete(0, start)
-
-            val headerEnd = pending.indexOf("\r\n\r\n")
-            if (headerEnd < 0) return null
-            val headers = pending.substring(0, headerEnd)
-
-            val bodyLen = CONTENT_LENGTH.find(headers)
-                ?.groupValues?.get(1)?.trim()?.toIntOrNull() ?: 0
-            val total = headerEnd + 4 + bodyLen
-            if (pending.length < total) return null
-
-            val msg = pending.substring(0, total)
-            pending.delete(0, total)
-            return msg
+        val bytes = pending.toByteArray()
+        var start = 0
+        while (start < bytes.size && (bytes[start] == '\r'.code.toByte() || bytes[start] == '\n'.code.toByte())) {
+            start++
         }
+        if (start > 0) {
+            pending.reset()
+            pending.write(bytes, start, bytes.size - start)
+        }
+        val buffer = pending.toByteArray()
+        val headerEnd = indexOf(buffer, "\r\n\r\n".toByteArray(Charsets.US_ASCII))
+        if (headerEnd < 0) return null
+        val headers = String(buffer, 0, headerEnd, Charsets.UTF_8)
+        val bodyLen = CONTENT_LENGTH.find(headers)
+            ?.groupValues?.get(1)?.trim()?.toIntOrNull() ?: 0
+        val total = headerEnd + 4 + bodyLen
+        if (buffer.size < total) return null
+
+        val msg = String(buffer, 0, total, Charsets.UTF_8)
+        pending.reset()
+        if (total < buffer.size) pending.write(buffer, total, buffer.size - total)
+        return msg
+    }
+
+    private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
+        if (needle.isEmpty() || haystack.size < needle.size) return -1
+        outer@ for (i in 0..haystack.size - needle.size) {
+            for (j in needle.indices) {
+                if (haystack[i + j] != needle[j]) continue@outer
+            }
+            return i
+        }
+        return -1
     }
 
     override fun close() {
@@ -263,7 +275,7 @@ class TlsSipTransport(
         socket = null
         input = null
         output = null
-        pending.setLength(0)
+        pending.reset()
     }
 
     private companion object {

@@ -20,6 +20,10 @@ if (Test-Path $envFile) {
     . $envFile
 }
 
+# Build-Magisk needs the compression types; load them here rather than relying
+# on which function happens to run first.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 # ── Check prerequisites ──────────────────────────────
 
 function Test-Java {
@@ -77,14 +81,21 @@ function Test-GradleWrapper {
     if (-not (Test-Path $jar)) {
         $needDownload = $true
     } else {
+        # This always meant to open the jar as a zip, but reported corruption
+        # every build because the compression assembly was not loaded here.
         try {
-            # Validate jar by checking it's a valid zip
             $zip = [System.IO.Compression.ZipFile]::OpenRead($jar)
-            $zip.Dispose()
+            try {
+                if ($zip.Entries.Count -eq 0) { $needDownload = $true }
+            } finally {
+                $zip.Dispose()
+            }
         } catch {
-            Write-Host "WARNING: gradle-wrapper.jar is corrupt, re-downloading..."
-            Remove-Item $jar -Force -ErrorAction SilentlyContinue
             $needDownload = $true
+        }
+        if ($needDownload) {
+            Write-Host "WARNING: gradle-wrapper.jar is not a valid zip, re-downloading..."
+            Remove-Item $jar -Force -ErrorAction SilentlyContinue
         }
     }
 

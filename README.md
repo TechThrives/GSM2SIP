@@ -17,7 +17,7 @@ Bridges Android phone to any SIP server as GSM Gateway
 A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gateway:
 
 - **Inbound**: Someone calls the SIM's number → the phone answers → the call is bridged to the SIP server, which routes it wherever the dialplan says (an AI agent, a queue, an extension)
-- **Outbound**: the SIP server sends an INVITE with an `X-GSM-Forward: +<number>` header → the phone dials that number over GSM → audio is bridged back to SIP
+- **Outbound**: the SIP server sends an INVITE with `X-GSM-From: +<SIM-number>` and `X-GSM-To: +<destination>` → the phone dials the destination over GSM → audio is bridged back to SIP
 - **SMS**: messages arriving on any SIM are forwarded to the server as SIP MESSAGE, and the server can ask the gateway to send one and be told what became of it — see [SMS over SIP](#sms-over-sip)
 
 Audio flows through shared speaker/mic — both GSM and SIP audio run concurrently on the same hardware, enabled by a Magisk module that disables Android's audio concurrency restrictions.
@@ -42,20 +42,14 @@ remote actually offered rather than failing a call over a preference.
 | Device | SoC | Agent → caller | Caller → agent | Status |
 |---|---|---|---|---|
 | Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** |
-| Samsung Galaxy S4 Mini (`serranolte`) | Qualcomm MSM8960, WCD9304 | digital, via `incall_music` | digital, via `VOC_REC_*` | **fully working** |
 | Samsung Galaxy S10e | Exynos 9820, CS47L93 | no path | no path | not usable |
 
 **The Poco X3 NFC is the reference device and works fully**: G.722 wideband in
 both directions, entirely through the modem, with the handset's own microphone
 and speaker muted for the whole call.
 
-**The Galaxy S4 Mini works fully too**, which is worth dwelling on because it
-is a 2013 handset on LineageOS 16 (Android 9) and armeabi-v7a — and because its
-own vendor configuration claims it cannot.  Its
-`audio_policy_configuration.xml` declares no `incall_music_uplink` mixPort and
-no Telephony Tx device, and `mixer_paths.xml` has no incall-music path at all,
-yet the kernel exposes `Incall_Music Audio Mixer MultiMedia1/2` and
-`MultiMedia1 Mixer VOC_REC_DL/UL` regardless.
+**The Galaxy S4 Mini is not supported by the current APK** because the app requires
+Android API 31 or newer.
 
 ### Choosing a device
 
@@ -79,7 +73,6 @@ What has actually been checked so far:
 | Device | SoC | Vendor | Result |
 |---|---|---|---|
 | Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
-| Galaxy S4 Mini | MSM8960 | LineageOS 16 | fully working, verified on a live call |
 | Galaxy S10e | Exynos 9820 | — | no path in either direction |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
@@ -156,25 +149,21 @@ Only the Magisk module needs to be installed — it includes the APK and handles
 3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → GSM2SIP
 4. **Configure SIP**: open Settings in the app (the gear, top right) and enter
    your SIP server address, port, username and password
-5. **Own Number**: Enter the SIM's own number in international format, e.g.
-   `+4915112345678`.  This is sent as the SIP destination so the server can
-   route on the number that was dialled, the same way a VoIP router sends the
-   DID.  Leaving it unset makes the gateway address its own extension,
-   which most servers route straight back to the device — the call then loops
-   and the GSM leg is never answered.
+5. **Own Number**: Enter the SIM's own number in strict international E.164
+   format, e.g. `+4915112345678`. It is used as the `X-GSM-To` value for
+   incoming calls and as the source identity for SMS. The gateway rejects a
+   call when no valid own number is available.
 6. **Start**: the gateway registers and begins bridging calls; the header pill
    shows **Online** once registration succeeds (tap it to retry)
 
 ### What the SIP leg carries
 
-- **Request-URI / To** — the number that was dialled, i.e. the gateway SIM's
-  MSISDN.  Not the SIP account name.
-- **From** — the calling party, passed through exactly as the carrier delivered
-  it (some send `+49…`, some `0…`; the app does not rewrite it).
+- **Request-URI** — SIP peer/account addressing only.
+- **X-GSM-From** — the human caller, normalized to strict `+E.164`.
+- **X-GSM-To** — the receiving SIM's number, normalized to strict `+E.164`.
 
-Whatever the server routes on, it has to recognise the SIM's number: the
-gateway puts that number in the Request-URI, so a dialplan or number table
-keyed on it is what decides where the call goes.
+The server must route from the mandatory `X-GSM-*` headers. The Request-URI is
+not a routing fallback.
 
 ## Quick start with callagent.pro
 
@@ -190,90 +179,44 @@ there is nothing to write on the server side:
 
 ## The longer way: your own Asterisk
 
-The gateway is server-agnostic — it registers like any SIP client — so you can
-point it at a server you run instead. What follows is one worked example,
-using Asterisk (chan_sip) to route inbound GSM calls to an AI agent. Adapt it
-to whatever your server does.
+The gateway is server-agnostic and registers like a SIP client. The repository's
+Docker deployment uses Asterisk `res_pjsip`, not the older `chan_sip` examples.
+Use the checked-in configuration as the canonical setup:
 
-It addresses calls the way a VoIP router does: the Request-URI carries the
-SIM's number and `From` carries the calling party. That shapes the config
-below in two ways — the extension to match is the SIM's MSISDN in E.164, so
-the pattern has to accept the leading `+`, and the From user is no longer the
-account name, so the peer has to be recognised by the address it registered
-from rather than by who the INVITE says it is.
+- `infra/config/pjsip.conf` defines the `1001` gateway endpoint and
+  `message_context=sms-from-gsm`.
+- `infra/config/extensions.conf` reads mandatory `X-GSM-*` and `X-SMS-*`
+  headers and never routes from the Request-URI as a fallback.
+- `infra/config/websocket_client.conf` connects Asterisk media to the API.
 
-### 1. Create a SIP account for the gateway
+For incoming calls, the SIP Request-URI only addresses the peer. The server
+must use `X-GSM-From` and `X-GSM-To`, both strict `+E.164`, for routing.
+For outgoing calls, the API supplies the same pair through ARI/PJSIP variables.
+For SMS, `X-SMS-From` and `X-SMS-To` are mandatory and strict `+E.164`.
 
-Add to `sip.conf` or create via the realtime database:
+Do not copy legacy `chan_sip` `SIPAddHeader()`, `accept_outofcall_message`,
+or Request-URI/`${EXTEN}` routing examples into this deployment.
 
-```ini
-[gateway-gw1](agent-template)
-type = friend
-host = dynamic
-secret = <strong-password>
-context = gateway-incoming
-; From carries the GSM caller, not "gateway-gw1".  If chan_sip then logs "no
-; matching peer" for the caller's number, this makes it match on the address
-; the gateway registered from instead.
-insecure = port,invite
-; The gateway offers G.722 only unless Settings → Codec says otherwise.
-disallow = all
-allow = g722
-```
+### Outgoing calls through the gateway
 
-### 2. Add gateway dialplan context
-
-Add to `extensions.conf`:
-
-```ini
-; Gateway incoming calls (GSM → SIP → Agent)
-; EXTEN is the SIM's own number in international format, e.g. +4915112345678
-; — the leading "+" is why this is _+X. and not _X.
-[gateway-incoming]
-exten => _+X.,1,NoOp(GSM call for ${EXTEN} from ${CALLERID(num)})
-same => n,Set(CDR(destination)=${EXTEN})
-same => n,Set(CDR(userfield)=gateway-gw1)
-; Route on the number that was dialled, the way a DID is routed — one server,
-; several gateway SIMs, each landing on its own agent.
-same => n,Set(AgentToUse=${ODBC_AGENT_LOOKUP(${EXTEN})})
-same => n,GotoIf($["${AgentToUse}" = ""]?default_agent:route_to_agent)
-same => n(route_to_agent),MixMonitor(/var/spool/asterisk/monitor/${STRFTIME(${EPOCH},,%Y%m%d-%H%M%S)}-${UNIQUEID}.wav)
-same => n,Dial(SIP/${AgentToUse},60,tT)
-same => n,Hangup()
-same => n(default_agent),MixMonitor(/var/spool/asterisk/monitor/${STRFTIME(${EPOCH},,%Y%m%d-%H%M%S)}-${UNIQUEID}.wav)
-same => n,Dial(SIP/100,60,tT)
-same => n,Hangup()
-```
-
-`${CALLERID(num)}` is the GSM caller, passed through as the carrier delivered
-it — some carriers send `+49…`, some `0…`, and the gateway rewrites neither.
-Normalise it before any lookup that keys on the caller.
-
-### 3. Making outbound calls through the gateway
-
-Address the call the same way you would address a message: put the number in
-the Request-URI and dial the peer.
+Both routing headers are mandatory. `X-GSM-From` identifies the SIM that must
+place the GSM call, and `X-GSM-To` is the human destination. The Request-URI
+only addresses the SIP account and is not used as a fallback.
 
 ```ini
 exten => _X.,1,NoOp(Outbound via GSM gateway: ${EXTEN})
-same => n,Dial(SIP/gateway-gw1/${EXTEN},60)
-same => n,Hangup()
+ same => n,Set(PJSIP_HEADER(add,X-GSM-From)=${SIM_NUMBER})
+ same => n,Set(PJSIP_HEADER(add,X-GSM-To)=${EXTEN})
+ same => n,Dial(PJSIP/1001,60)
+ same => n,Hangup()
 ```
 
-`X-GSM-Forward` does the same job and takes precedence where both are present,
-which is what a dialplan needs when the number it dials is not the number it
-wants called:
+With ARI, pass the same PJSIP variables when originating the channel:
 
-```ini
-same => n,SIPAddHeader(X-GSM-Forward: ${EXTEN})
-same => n,Dial(SIP/gateway-gw1,60)
+```text
+PJSIP_HEADER(add,X-GSM-From)=+4915112345678
+PJSIP_HEADER(add,X-GSM-To)=+4917098765432
 ```
-
-The user part of the Request-URI is only read as a destination when it is one:
-the account name and the SIM's own number are both ignored, since dialling
-either would be a loop, and so is anything that is not a bare number. Under
-`chan_pjsip`, note that `SIPAddHeader()` is silently a no-op — the header form
-there is `Set(PJSIP_HEADER(add,X-GSM-Forward)=${EXTEN})`.
 
 Allow enough time in `Dial()` for GSM setup — 60s is comfortable, 20s is not.
 
@@ -306,10 +249,8 @@ mobile has not picked up yet — if you ever hear the agent start talking before
 you answer, something other than this gateway put it there. `183 Session
 Progress` is never sent for that reason.
 
-A `488` means the INVITE named no number the gateway could dial — neither an
-`X-GSM-Forward` header nor a usable Request-URI. Under `chan_sip` that usually
-means `SIPAddHeader()` ran on a different channel than the one that was
-dialled; under `chan_pjsip` it means `SIPAddHeader()` ran at all.
+A `488` means the INVITE did not contain both mandatory GSM routing headers,
+or `X-GSM-From` did not resolve to an active SIM.
 
 Only a call the gateway answered is ended with `BYE`. One that never connected
 is turned down with the final response above, which is the only place the
@@ -349,7 +290,7 @@ re-grants them over root at bring-up if they are missing.
 One MESSAGE per message, already reassembled from its parts:
 
 ```
-MESSAGE sip:+4915112345678@example.com SIP/2.0
+MESSAGE sip:1001@example.com SIP/2.0
 From: <sip:+4917098765432@example.com>;tag=gw123456789
 To: <sip:+4915112345678@example.com>
 X-SMS-Id: 550e8400-e29b-41d4-a716-446655440000
@@ -357,16 +298,13 @@ X-SMS-From: +4917098765432
 X-SMS-To: +4915112345678
 X-SMS-Received: 2026-09-08T16:20:31Z
 X-SMS-Parts: 1
-X-SMS-Sim-Sub: 1
-X-SMS-Sim-Slot: 1
-X-SMS-Sim-Carrier: ExampleMobile
 Content-Type: text/plain;charset=UTF-8
 
 Hello from a mobile
 ```
 
-The Request-URI is the receiving SIM's own number, so an SMS presents the same
-routing key an inbound call does. `X-SMS-Id` is the idempotency key: answer
+The Request-URI addresses the registered SIP account (`1001`); `X-SMS-From`
+and `X-SMS-To` are the authoritative routing pair. `X-SMS-Id` is the idempotency key: answer
 `200` or `202` and the message is done, answer anything else — or nothing — and
 the same id is retried every 30s until it lands. A message that arrives while
 SIP is down is written to disk and sent when registration returns.
@@ -374,18 +312,20 @@ SIP is down is written to disk and sent when registration returns.
 ### Server → SMS
 
 ```
-MESSAGE sip:+4917098765432@example.com SIP/2.0
+MESSAGE sip:1001@example.com SIP/2.0
 X-SMS-Id: 0ca1c8ad-27e1-4c9e-b6b4-41abca9805d3
-X-SMS-Sim-Slot: 1
+X-SMS-From: +4915112345678
+X-SMS-To: +4917098765432
 Content-Type: text/plain;charset=UTF-8
 
 Reply from the agent
 ```
 
-The recipient is the Request-URI user, or `X-SMS-To` if you would rather keep
-the URI generic. `X-SMS-Sim-Slot` (or `X-SMS-Sim-Sub`) picks the SIM — a
-dual-SIM gateway has no meaningful default, since a reply has to leave by the
-SIM the conversation is on.
+`X-SMS-From` and `X-SMS-To` are both mandatory. `X-SMS-From` is the SIM number
+that must send the message and must resolve to exactly one active SIM;
+`X-SMS-To` is the human recipient. The Request-URI only addresses the SIP
+account and is never used as a substitute for either header. Device-local
+subscription IDs and SIM slots are intentionally not exposed on the wire.
 
 The response says what the message will cost before you commit to the text:
 
@@ -395,7 +335,8 @@ X-SMS-Parts: 1
 X-SMS-Encoding: GSM7
 ```
 
-**Only `202` is a promise.** `400` missing recipient or body, `415` body is not
+**Only `202` is a promise.** `400` missing `X-SMS-From`/`X-SMS-To`, an unknown
+source SIM, or an empty body; `415` body is not
 `text/plain`, `503` `SEND_SMS` not granted (retry later), `405` SMS handling
 unavailable — none of those queued anything. A repeat carrying an id already
 held is answered `202` and not sent again.
@@ -407,13 +348,15 @@ finds that out in time to do something about it.
 
 ### Delivery reports
 
-Two reports come back, each a MESSAGE addressed to the SIM's own number — so
-they arrive in the same context as an inbound SMS, and `X-SMS-Event` is what
-tells them apart.
+Two reports come back as SIP MESSAGE requests addressed to the registered
+account (`1001`). `X-SMS-Event` tells reports apart from inbound SMS, while
+`X-SMS-From` and `X-SMS-To` retain the original source-SIM and human-recipient
+routing pair.
 
 ```
 X-SMS-Id: 0ca1c8ad-27e1-4c9e-b6b4-41abca9805d3
 X-SMS-Event: submitted
+X-SMS-From: +4915112345678
 X-SMS-To: +4917098765432
 X-SMS-Parts: 1
 X-SMS-At: 2026-09-08T16:56:09Z
@@ -456,22 +399,23 @@ auth_message_requests=yes
 
 #### Receiving: SMS and delivery reports
 
-Both arrive addressed to the SIM's own number, so one context handles them and
-`X-SMS-Event` is what separates a message from a report on something we sent.
+Both arrive at the registered account, so one context handles them. The
+mandatory `X-SMS-From`/`X-SMS-To` pair carries routing, and `X-SMS-Event`
+separates an inbound message from a report on something we sent.
 
 ```ini
-; extensions.conf — exten is the Request-URI user, i.e. the SIM's number
+; extensions.conf — exten is the registered account user (1001)
 [messages]
 exten => _+X.,1,NoOp(${MESSAGE(from)} -> ${MESSAGE(to)})
  same => n,Set(ID=${SIP_HEADER(X-SMS-Id)})
  same => n,Set(EVENT=${SIP_HEADER(X-SMS-Event)})
  same => n,GotoIf($["${EVENT}" != ""]?report)
 
-; A received SMS.  CALLERID(num) is the sender, MESSAGE(body) the reassembled
-; text; X-SMS-Sim-Slot says which SIM took it, which is the slot a reply has
-; to leave by.
- same => n,Set(SLOT=${SIP_HEADER(X-SMS-Sim-Slot)})
- same => n,AGI(sms_in.agi,${ID},${CALLERID(num)},${MESSAGE(to)},${SLOT},${MESSAGE(body)})
+; A received SMS. X-SMS-From is the human sender and X-SMS-To is the
+; receiving SIM. MESSAGE(body) is the reassembled text.
+ same => n,Set(FROM=${SIP_HEADER(X-SMS-From)})
+ same => n,Set(TO=${SIP_HEADER(X-SMS-To)})
+ same => n,AGI(sms_in.agi,${ID},${FROM},${TO},${MESSAGE(body)})
  same => n,Hangup()
 
 ; A report on something we asked the gateway to send.  ID is the same id the
@@ -488,24 +432,22 @@ closes it too early. `failed` and `delivered`/`undelivered` are terminal.
 
 #### Sending
 
-`MessageSend()` addresses the peer, so the Request-URI it builds carries the
-account name, not the recipient. The gateway reads `X-SMS-To` first and falls
-back to the Request-URI, so the recipient goes in that header:
+`MessageSend()` addresses the SIP peer, so the Request-URI carries the account
+name rather than the human recipient. Both routing values are mandatory
+headers: `X-SMS-From` selects the sending SIM and `X-SMS-To` names the human
+recipient.
 
 ```ini
-; extensions.conf — Gosub(sms-out,s,1(+4917098765432,Reply from the agent))
+; extensions.conf — Gosub(sms-out,s,1(+4917098765432,Reply from the agent,+4915112345678))
 [sms-out]
 exten => s,1,NoOp(SMS to ${ARG1})
  same => n,Set(MESSAGE(body)=${ARG2})
  same => n,Set(MESSAGE(custom_data)=mark_all_outbound)
+ same => n,Set(MESSAGE_DATA(X-SMS-From)=${ARG3})
  same => n,Set(MESSAGE_DATA(X-SMS-To)=${ARG1})
-; Our own id, so the delivery reports can be matched back to this send.  Omit
-; it and the gateway mints one, which arrives only in the reports.
+; X-SMS-Id is mandatory. Reuse the same stable id for retries so the
+; gateway can deduplicate the request and match delivery reports.
  same => n,Set(MESSAGE_DATA(X-SMS-Id)=${UNIQUEID})
-; Only needed on a dual-SIM gateway — the slot the conversation is on.
- same => n,Set(MESSAGE_DATA(X-SMS-Sim-Slot)=1)
-; Second argument is who it is from, as the server sees it — the gateway does
-; not read it, but it is what lands in the CDR.
  same => n,MessageSend(sip:gateway-gw1,sip:agent@example.com)
  same => n,NoOp(send status: ${MESSAGE_SEND_STATUS})
  same => n,Return()
@@ -519,17 +461,20 @@ cares about part count has to measure the text itself: one character outside
 GSM-7 takes the whole message to UCS-2 and 70 characters a part.
 
 Nothing above is dialplan-only — AMI's `MessageSend` action and ARI's
-`POST /endpoints/sendMessage` take the same body and variables.
+`PUT /endpoints/{tech}/{resource}/sendMessage` take the same body and variables.
 
-#### chan_sip specifics worth knowing
+#### SMS delivery notes
 
-It emits the `202` for a received message itself, before the dialplan runs, so
-a dialplan failure will not make the gateway retry — write durably early and
-dedupe on `X-SMS-Id`. An unmatched extension returns `404`, which the gateway
-reads as not-accepted and retries every 30s, so make sure the pattern covers
-the SIM's number format. And if your build does not carry `MESSAGE_DATA()`
-headers outbound, sends still work: the gateway mints its own id and uses the
-default SIM, and only `X-SMS-To` is genuinely required.
+The gateway requires both strict E.164 routing headers:
+
+```text
+X-SMS-From
+X-SMS-To
+```
+
+`X-SMS-From` must resolve to exactly one active SIM. Device-local subscription
+IDs and SIM slots are not wire fields and are never used as fallbacks. The SIP
+account in the Request-URI only addresses the registered peer.
 
 Carriers also rate-limit SMS independently of anything here: a run of sends can
 end in `modem_err/facility_rejected` for every destination, including the SIM's

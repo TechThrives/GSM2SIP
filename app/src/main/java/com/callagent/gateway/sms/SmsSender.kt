@@ -4,8 +4,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.telephony.SmsManager
-import android.telephony.SubscriptionManager
 import android.util.Log
+import com.callagent.gateway.OwnNumber
 
 /**
  * Hands an outbound SMS to the modem and keeps the paperwork straight.
@@ -114,11 +114,11 @@ object SmsSender {
         // here means the platform never registered the service at all.
         val base = context.getSystemService(SmsManager::class.java)
             ?: error("SmsManager system service unavailable")
-        return if (subId >= 0 && subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-            runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
-        } else {
-            base
+        if (!OwnNumber.isValidSubscription(subId)) {
+            error("No valid SIM subscription for SMS source")
         }
+        return runCatching { base.createForSubscriptionId(subId) }
+            .getOrElse { error("Could not bind SmsManager to subscription $subId: ${it.message}") }
     }
 
     /**

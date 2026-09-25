@@ -1,5 +1,6 @@
 package com.callagent.gateway.rtp
 
+import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
@@ -10,6 +11,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
@@ -274,6 +276,14 @@ class RtpSession(
      * does NOT inject via incall_music — that's why SIP→GSM was silent.
      */
     private fun initAudio(): Boolean {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.e(TAG, "RECORD_AUDIO permission is not granted; cannot initialize capture")
+            listener?.onRtpError("RECORD_AUDIO permission is not granted")
+            return false
+        }
+
         // Before anything is opened: in-call recording and the per-session
         // voice mutes are gated on the HAL's is_call_active flag, and the HAL
         // chooses the input usecase when the record stream is created.  Telling
@@ -462,15 +472,22 @@ class RtpSession(
         // earpiece but is NEVER injected into the modem uplink.
         // Using default (deep-buffer-playback → MultiMedia1) ensures the
         // Incall_Music Audio Mixer MultiMedia1 routes audio to the caller.
-        val usage = if (profile.playbackUsage >= 0) profile.playbackUsage
-                    else AudioAttributes.USAGE_MEDIA
+        val usage = when (profile.playbackUsage) {
+            AudioAttributes.USAGE_MEDIA -> AudioAttributes.USAGE_MEDIA
+            AudioAttributes.USAGE_VOICE_COMMUNICATION ->
+                AudioAttributes.USAGE_VOICE_COMMUNICATION
+            else -> {
+                Log.w(
+                    TAG,
+                    "Unsupported playback usage ${profile.playbackUsage}; using USAGE_MEDIA"
+                )
+                AudioAttributes.USAGE_MEDIA
+            }
+        }
         val contentType = if (usage == AudioAttributes.USAGE_VOICE_COMMUNICATION)
             AudioAttributes.CONTENT_TYPE_SPEECH else AudioAttributes.CONTENT_TYPE_MUSIC
-        playbackUsageName = when (usage) {
-            AudioAttributes.USAGE_MEDIA -> "MEDIA"
-            AudioAttributes.USAGE_VOICE_COMMUNICATION -> "VOICE_COMMUNICATION"
-            else -> "usage=$usage"
-        }
+        playbackUsageName = if (usage == AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            "VOICE_COMMUNICATION" else "MEDIA"
         // Must happen before the track exists on HALs that pick the output
         // usecase at creation time — see DeviceProfile.incallMusicBeforeTrack.
         if (profile.incallMusicBeforeTrack) {
@@ -540,6 +557,14 @@ class RtpSession(
      * direction (GSM→SIP) takes longer to come up.
      */
     private fun captureInitAndLoop() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.e(TAG, "RECORD_AUDIO permission was revoked; stopping capture")
+            listener?.onRtpError("RECORD_AUDIO permission was revoked")
+            return
+        }
+
         // Fast path: AudioRecord was already initialized in initAudio (warm boot)
         if (audioRecord != null) {
             if (captureLoop() || !running.get()) return

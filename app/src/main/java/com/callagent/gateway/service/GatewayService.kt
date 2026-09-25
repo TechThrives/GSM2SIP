@@ -18,13 +18,12 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.telephony.TelephonyManager
 import com.callagent.gateway.sms.OutboundSms
-import com.callagent.gateway.sms.PendingSms
+import com.callagent.gateway.sms.InboundSms
 import com.callagent.gateway.sms.SmsOutbox
 import com.callagent.gateway.sms.SmsSender
-import com.callagent.gateway.sms.SmsStore
+import com.callagent.gateway.sms.SmsInbox
 import android.util.Log
 import com.callagent.gateway.BuildConfig
-import com.callagent.gateway.GatewayApp
 import com.callagent.gateway.MainActivity
 import com.callagent.gateway.OwnNumber
 import com.callagent.gateway.R
@@ -337,7 +336,7 @@ class GatewayService : Service() {
         if (!hasReceiveSms()) grantViaRoot("android.permission.RECEIVE_SMS")
         if (!hasSendSms()) grantViaRoot("android.permission.SEND_SMS")
 
-        val queued = SmsStore.pending(this).size
+        val queued = SmsInbox.pending(this).size
         if (hasReceiveSms()) {
             broadcastLog("SMS receive: ready${if (queued > 0) " ($queued queued)" else ""}")
         } else {
@@ -377,6 +376,11 @@ class GatewayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         clearStaleInitializing()
+        if (intent?.action in setOf(ACTION_SMS_SEND, ACTION_SMS_REPORT, ACTION_SMS_FLUSH) &&
+            sipClient == null && !initializing.get()
+        ) {
+            startGateway(intent)
+        }
         when (intent?.action) {
             ACTION_START -> startGateway(intent)
             ACTION_STOP -> stopGateway()
@@ -415,7 +419,6 @@ class GatewayService : Service() {
                 startForeground(activeNotificationId(), buildNotification(notifState))
                 flushSmsQueue("received")
             }
-            ACTION_DIAL -> dialFromDialler(intent)
             ACTION_MUTE_AGENT -> {
                 agentMuted = if (intent.hasExtra(EXTRA_MUTE_ON)) {
                     intent.getBooleanExtra(EXTRA_MUTE_ON, false)
@@ -540,7 +543,7 @@ class GatewayService : Service() {
         if (!smsFlushing.compareAndSet(false, true)) return
         thread(name = "sms-flush") {
             try {
-                val queue = SmsStore.pending(this)
+                val queue = SmsInbox.pending(this)
                 if (queue.isEmpty()) return@thread
                 val sip = sipClient
                 if (sip == null || !sip.registered) {
@@ -559,10 +562,16 @@ class GatewayService : Service() {
                 for (sms in queue) {
                     val code = sendSmsOverSip(sip, sms)
                     if (code == 200 || code == 202) {
-                        SmsStore.remove(this, sms.id)
+                        SmsInbox.remove(this, sms.id)
+                        CallLogStore.updateSms(this, sms.id) { it.copy(status = "forwarded") }
                         broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
+                    } else if (code == 400) {
+                        SmsInbox.remove(this, sms.id)
+                        CallLogStore.updateSms(this, sms.id) { it.copy(status = "discarded") }
+                        broadcastLog("SMS: ${sms.id} discarded as permanently invalid")
                     } else {
-                        SmsStore.markAttempt(this, sms.id)
+                        SmsInbox.markAttempt(this, sms.id)
+                        CallLogStore.updateSms(this, sms.id) { it.copy(status = "queued") }
                         broadcastLog(
                             "SMS: ${sms.id} from ${sms.from} not accepted " +
                                 "(${if (code == 0) "no response" else code.toString()}) — queued"
@@ -600,30 +609,26 @@ class GatewayService : Service() {
 
     /**
      * The wire format, in one place so it can be read against the server's
-     * dialplan.  Request-URI addresses the SIM's own number where the SIM
-     * reports one, falling back to the configured own number and then to the
-     * SIP account — the same routing key an inbound *call* uses, so the server
-     * can map an SMS to an assistant exactly as it maps a call.
+     * dialplan. The Request-URI addresses the registered SIP account; the
+     * mandatory X-SMS-* headers carry the strict E.164 routing values.
      */
-    private fun sendSmsOverSip(sip: SipClient, sms: PendingSms): Int {
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val configuredOwn = ownNumberForSub(sms.subId)
-        val target = sms.to.ifEmpty { configuredOwn }.ifEmpty { cfgUser }
-        val targetUri = "sip:$target@$cfgServer"
+    private fun sendSmsOverSip(sip: SipClient, sms: InboundSms): Int {
+        if (!OwnNumber.isE164(sms.from) || !OwnNumber.isE164(sms.to)) {
+            Log.w(TAG, "Dropping queued SMS ${sms.id}: from/to must be +E.164")
+            return 400
+        }
+        val targetUri = "sip:$cfgUser@$cfgServer"
         val headers = mutableListOf(
             "X-SMS-Id: ${sms.id}",
             "X-SMS-From: ${sms.from}",
-            "X-SMS-To: $target",
+            "X-SMS-To: ${sms.to}",
             "X-SMS-Received: ${smsTimeFormat.format(java.util.Date(sms.receivedAt))}",
             "X-SMS-Parts: ${sms.parts}"
         )
-        if (sms.subId >= 0) headers += "X-SMS-Sim-Sub: ${sms.subId}"
-        if (sms.slot >= 0) headers += "X-SMS-Sim-Slot: ${sms.slot}"
-        if (sms.carrier.isNotEmpty()) headers += "X-SMS-Sim-Carrier: ${sms.carrier}"
         if (sms.attempts > 0) headers += "X-SMS-Attempt: ${sms.attempts + 1}"
         return sip.sendSipMessage(
             targetUri = targetUri,
-            fromUser = sms.from.ifEmpty { "unknown" },
+            fromUser = sms.from,
             body = sms.text,
             extraHeaders = headers
         )
@@ -645,10 +650,8 @@ class GatewayService : Service() {
             broadcastLog("SMS send refused: unsupported Content-Type '$type'")
             return 415 to emptyList()
         }
-        val target = (msg.header("x-sms-to")
-            ?: msg.requestUri?.let { msg.extractUser(it) }
-            ?: msg.to?.let { msg.extractUser(it) })
-            ?.trim().orEmpty()
+        val target = msg.header("x-sms-to")?.trim().orEmpty()
+        val source = msg.header("x-sms-from")?.trim().orEmpty()
         // Reduce to ASCII before anything measures or stores the text, so the
         // part count, the encoding and the log all describe what actually
         // goes out rather than what the server sent.
@@ -669,8 +672,10 @@ class GatewayService : Service() {
         } else if (foldToAscii && folded == null) {
             broadcastLog("SMS send: no ASCII spelling for this text — sending it unchanged as UCS-2")
         }
-        if (target.isEmpty() || text.isEmpty()) {
-            broadcastLog("SMS send refused: missing recipient or body")
+        if (!OwnNumber.isE164(source) || !OwnNumber.isE164(target) || text.isEmpty()) {
+            broadcastLog(
+                "SMS send refused: X-SMS-From and X-SMS-To must be +E.164; body is required"
+            )
             return 400 to emptyList()
         }
         if (!hasSendSms()) {
@@ -680,8 +685,11 @@ class GatewayService : Service() {
             return 503 to emptyList()
         }
 
-        val id = msg.header("x-sms-id")?.trim().takeUnless { it.isNullOrEmpty() }
-            ?: SmsStore.newId()
+        val id = msg.header("x-sms-id")?.trim().orEmpty()
+        if (id.isEmpty()) {
+            broadcastLog("SMS send refused: X-SMS-Id is required")
+            return 400 to emptyList()
+        }
         // What this message will actually cost, answered in the 202 rather
         // than after the fact: one character outside GSM-7 forces the whole
         // message to UCS-2, which halves a part from 160 characters to 70 —
@@ -696,15 +704,16 @@ class GatewayService : Service() {
             return 202 to cost
         }
 
-        val subId = resolveSubscription(
-            msg.header("x-sms-sim-sub")?.trim()?.toIntOrNull(),
-            msg.header("x-sms-sim-slot")?.trim()?.toIntOrNull()
-        )
+        val subId = OwnNumber.subscriptionIdForNumber(this, source)
+        if (subId == null) {
+            broadcastLog("SMS send refused: X-SMS-From $source does not match an active SIM")
+            return 400 to emptyList()
+        }
         val measured = measureSms(text)
         SmsOutbox.add(
             this,
             OutboundSms(
-                id = id, to = target, text = text, subId = subId,
+                id = id, from = source, to = target, text = text, subId = subId,
                 parts = measured?.parts ?: 0,
                 encoding = measured?.encoding ?: ""
             )
@@ -725,7 +734,10 @@ class GatewayService : Service() {
                 subId = subId
             )
         )
-        broadcastLog("SMS send: $id to $target accepted (${text.length} chars, sub=$subId)")
+        broadcastLog(
+            "SMS send: $id from $source to $target accepted " +
+                "(${text.length} chars, sub=$subId)"
+        )
 
         val intent = Intent(this, GatewayService::class.java).apply { action = ACTION_SMS_SEND }
         try {
@@ -767,24 +779,6 @@ class GatewayService : Service() {
     private fun measure(text: String): List<String> {
         val m = measureSms(text) ?: return emptyList()
         return listOf("X-SMS-Parts: ${m.parts}", "X-SMS-Encoding: ${m.encoding}")
-    }
-
-    /** Which SIM to send from: an explicit subscription wins, then a slot, then
-     *  whatever the platform considers default. */
-    private fun resolveSubscription(subId: Int?, slot: Int?): Int {
-        if (subId != null && subId >= 0) return subId
-        if (slot != null && slot >= 0) {
-            try {
-                val sm = getSystemService(android.telephony.SubscriptionManager::class.java)
-                @Suppress("MissingPermission")
-                val info = sm?.activeSubscriptionInfoList?.firstOrNull { it.simSlotIndex == slot }
-                if (info != null) return info.subscriptionId
-                broadcastLog("SMS send: no active SIM in slot $slot — using default")
-            } catch (e: Exception) {
-                Log.w(TAG, "Slot lookup failed: ${e.message}")
-            }
-        }
-        return android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID
     }
 
     private fun hasSendSms(): Boolean =
@@ -915,15 +909,14 @@ class GatewayService : Service() {
             Log.w(TAG, "SMS own number unavailable (sub=$subId is not a subscription) — using the SIP account")
             return ""
         }
-        val slot = runCatching {
-            getSystemService(android.telephony.SubscriptionManager::class.java)
-                ?.getActiveSubscriptionInfo(subId)?.simSlotIndex
-        }.getOrNull()
+        val slot = OwnNumber.simSlotForSubscription(this, subId)
         if (slot == null || slot < 0) {
             Log.w(TAG, "SMS own number unavailable (sub=$subId has no slot) — using the SIP account")
             return ""
         }
-        val configured = prefs.getString("own_number_slot_$slot", "")?.trim().orEmpty()
+        val configured = prefs.getString("own_number_slot_$slot", "")
+            ?.let { OwnNumber.toE164(this, it, subId) }
+            .orEmpty()
         if (configured.isEmpty()) {
             Log.w(TAG, "SMS own number unavailable (sub=$subId, slot $slot box empty) — using the SIP account")
         } else {
@@ -987,11 +980,15 @@ class GatewayService : Service() {
             broadcastLog("SMS report $event for ${sms.id} deferred — not registered")
             return false
         }
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val own = ownNumberForSub(sms.subId).ifEmpty { cfgUser }
+        val source = sms.from
+        if (!OwnNumber.isE164(source) || !OwnNumber.isE164(sms.to)) {
+            Log.w(TAG, "Not sending report ${sms.id}: from/to must be +E.164")
+            return false
+        }
         val body = org.json.JSONObject().apply {
             put("id", sms.id)
             put("event", event)
+            put("from", source)
             put("to", sms.to)
             put("parts", maxOf(sms.parts, 1))
             put("sentOk", sms.sentOk)
@@ -1011,6 +1008,7 @@ class GatewayService : Service() {
         val headers = mutableListOf(
             "X-SMS-Id: ${sms.id}",
             "X-SMS-Event: $event",
+            "X-SMS-From: $source",
             "X-SMS-To: ${sms.to}",
             "X-SMS-Parts: ${maxOf(sms.parts, 1)}",
             "X-SMS-At: ${smsTimeFormat.format(java.util.Date())}"
@@ -1025,8 +1023,8 @@ class GatewayService : Service() {
         // still JSON for anyone who wants to parse it, but every field is in
         // an X-SMS-* header too, so SIP_HEADER() alone is enough.
         val code = sip.sendSipMessage(
-            targetUri = "sip:$own@$cfgServer",
-            fromUser = own,
+            targetUri = "sip:$cfgUser@$cfgServer",
+            fromUser = source,
             body = body,
             extraHeaders = headers,
             contentType = "text/plain;charset=UTF-8"
@@ -1037,12 +1035,6 @@ class GatewayService : Service() {
                 if (ok) "acknowledged" else "not acknowledged (${if (code == 0) "no response" else code})"
         )
         return ok
-    }
-
-    private fun dialFromDialler(intent: Intent?) {
-        val number = intent?.getStringExtra(EXTRA_NUMBER) ?: return
-        orchestrator?.initiateDiallerCall(number)
-            ?: broadcastLog("ERROR: Gateway not running — cannot bridge to SIP")
     }
 
     /**
@@ -1120,7 +1112,8 @@ class GatewayService : Service() {
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "") ?: ""
-        val port = intent?.getIntExtra(EXTRA_PORT, 5060) ?: prefs.getInt("port", 5060)
+        val port = intent?.getIntExtra(EXTRA_PORT, prefs.getInt("port", 5060))
+            ?: prefs.getInt("port", 5060)
         val username = intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "") ?: ""
         val password = intent?.getStringExtra(EXTRA_PASS) ?: prefs.getString("pass", "") ?: ""
 
@@ -1274,6 +1267,7 @@ class GatewayService : Service() {
                     // Anything that arrived while SIP was down goes now, and
                     // any report the server never acknowledged goes again.
                     flushSmsQueue("registered")
+                    dispatchOutbox()
                     sweepOutboxReports()
                 } else if (!registered && state == CallOrchestrator.BridgeState.IDLE) {
                     onlineSince = 0L
@@ -1299,9 +1293,7 @@ class GatewayService : Service() {
                     currentCallStart = System.currentTimeMillis()
                     if (currentCallIncoming) incomingCalls++ else outgoingCalls++
                 }
-                if (state == CallOrchestrator.BridgeState.IDLE &&
-                    (currentCallStart != 0L || currentAttemptStart != 0L)
-                ) {
+                if (state == CallOrchestrator.BridgeState.IDLE && (currentCallStart != 0L || currentAttemptStart != 0L)) {
                     // A zero duration is how the list already renders an
                     // unconnected call ("Not connected", red dash), so a failed
                     // attempt needs no new field — only an entry.
@@ -1686,7 +1678,7 @@ class GatewayService : Service() {
                 val iface = interfaces.nextElement()
                 if (iface.isLoopback || !iface.isUp) continue
                 val addresses = iface.inetAddresses
-                while (addresses.hasMoreElements()) {
+                    while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
                         return addr.hostAddress ?: continue
@@ -1833,7 +1825,6 @@ class GatewayService : Service() {
         const val ACTION_RELOAD_STATS = "com.callagent.gateway.RELOAD_STATS"
         const val ACTION_STATUS = "com.callagent.gateway.STATUS_REQUEST"
         const val ACTION_RECONNECT = "com.callagent.gateway.RECONNECT"
-        const val ACTION_DIAL = "com.callagent.gateway.DIAL"
         const val ACTION_MONITOR = "com.callagent.gateway.MONITOR"
         const val EXTRA_MONITOR_ON = "monitor_on"
         const val ACTION_MUTE_AGENT = "com.callagent.gateway.MUTE_AGENT"
@@ -1842,7 +1833,6 @@ class GatewayService : Service() {
         const val EXTRA_PORT = "port"
         const val EXTRA_USER = "user"
         const val EXTRA_PASS = "pass"
-        const val EXTRA_NUMBER = "number"
         const val STATUS_ACTION = "com.callagent.gateway.STATUS"
         const val LOG_ACTION = "com.callagent.gateway.LOG"
         const val ACTION_APPLY_CONFIG = "com.callagent.gateway.APPLY_CONFIG"

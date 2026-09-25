@@ -12,7 +12,7 @@ import java.util.UUID
  * is the server's idempotency key: a MESSAGE whose response is lost gets sent
  * again, and only the id tells the server the second copy is the same SMS.
  */
-data class PendingSms(
+data class InboundSms(
     val id: String,
     val from: String,
     val to: String,
@@ -33,9 +33,9 @@ data class PendingSms(
  * only copy.  It is written to disk before any send is attempted, and removed
  * only once the server has answered 2xx.
  */
-object SmsStore {
-    private const val PREFS = "sms_queue"
-    private const val KEY = "pending"
+object SmsInbox {
+    private const val PREFS = "sms_inbox"
+    private const val KEY = "messages"
 
     /** Beyond this the queue is not a queue, it is a leak. Oldest go first. */
     private const val MAX_PENDING = 200
@@ -43,7 +43,7 @@ object SmsStore {
     fun newId(): String = UUID.randomUUID().toString()
 
     @Synchronized
-    fun add(context: Context, sms: PendingSms) {
+    fun add(context: Context, sms: InboundSms) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val arr = JSONArray(prefs.getString(KEY, "[]"))
         arr.put(toJson(sms))
@@ -52,7 +52,7 @@ object SmsStore {
     }
 
     @Synchronized
-    fun pending(context: Context): List<PendingSms> {
+    fun pending(context: Context): List<InboundSms> {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val arr = JSONArray(prefs.getString(KEY, "[]"))
         return (0 until arr.length()).mapNotNull { i ->
@@ -86,7 +86,7 @@ object SmsStore {
         prefs.edit().putString(KEY, arr.toString()).commit()
     }
 
-    private fun toJson(s: PendingSms) = JSONObject().apply {
+    private fun toJson(s: InboundSms) = JSONObject().apply {
         put("id", s.id)
         put("from", s.from)
         put("to", s.to)
@@ -99,7 +99,7 @@ object SmsStore {
         put("attempts", s.attempts)
     }
 
-    private fun fromJson(o: JSONObject) = PendingSms(
+    private fun fromJson(o: JSONObject) = InboundSms(
         id = o.getString("id"),
         from = o.optString("from"),
         to = o.optString("to"),

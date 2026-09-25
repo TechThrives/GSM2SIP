@@ -5,15 +5,12 @@ import android.content.Context
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.telecom.Call
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccountHandle
 import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.telecom.TelecomManager
-import android.telephony.TelephonyManager
 import android.telephony.SubscriptionManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
@@ -258,67 +255,6 @@ object GsmCallManager {
      * A failed placeCall is reported to the caller; no generic ACTION_CALL
      * fallback is used because it cannot carry the selected Telecom account.
      */
-    /**
-     * True for dial strings that are MMI/USSD codes rather than phone numbers
-     * — anything containing '*' or '#', e.g. *132# (balance) or *#06# (IMEI).
-     *
-     * These must never reach placeCall: Telecom rejects them with
-     * "Connection is null, DIALED_MMI", and on this build that took
-     * TelephonyConnectionService down with it.
-     */
-    fun isMmiCode(dialString: String): Boolean {
-        val s = dialString.trim()
-        return s.isNotEmpty() && (s.contains('*') || s.contains('#'))
-    }
-
-    /**
-     * Run an MMI/USSD code and report the network's answer via [onResult].
-     *
-     * USSD codes (those ending in '#') go through sendUssdRequest, which hands
-     * the reply back to us so it can be logged — useful on a headless gateway
-     * where nobody is watching for a system dialog.  Anything else (IMEI
-     * lookups, call-forwarding shortcuts) goes to Telecom's own MMI handling.
-     */
-    @SuppressLint("MissingPermission")
-    fun sendMmi(context: Context, dialString: String, onResult: (String) -> Unit) {
-        val code = dialString.trim()
-        if (code.endsWith("#")) {
-            try {
-                val telephony =
-                    context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-                telephony.sendUssdRequest(
-                    code,
-                    object : TelephonyManager.UssdResponseCallback() {
-                        override fun onReceiveUssdResponse(
-                            tm: TelephonyManager, request: String, response: CharSequence
-                        ) {
-                            Log.i(TAG, "USSD $request → $response")
-                            onResult(response.toString())
-                        }
-
-                        override fun onReceiveUssdResponseFailed(
-                            tm: TelephonyManager, request: String, failureCode: Int
-                        ) {
-                            Log.w(TAG, "USSD $request failed (code $failureCode)")
-                            onResult("USSD $request failed (code $failureCode)")
-                        }
-                    },
-                    Handler(Looper.getMainLooper())
-                )
-                return
-            } catch (e: Exception) {
-                Log.w(TAG, "sendUssdRequest failed (${e.message}) — falling back to Telecom")
-            }
-        }
-        try {
-            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            val handled = telecom.handleMmi(code)
-            onResult(if (handled) "MMI $code sent" else "MMI $code not recognised")
-        } catch (e: Exception) {
-            onResult("MMI $code failed: ${e.message}")
-        }
-    }
-
     @SuppressLint("MissingPermission")
     private fun phoneAccountForSubscription(
         context: Context,
@@ -361,6 +297,10 @@ object GsmCallManager {
         toNumber: String,
         fromNumber: String
     ): Boolean {
+        if (!OwnNumber.isE164(toNumber) || !OwnNumber.isE164(fromNumber)) {
+            Log.e(TAG, "Rejecting non-E.164 GSM call: to='$toNumber' from='$fromNumber'")
+            return false
+        }
         Log.i(TAG, "Making GSM call to $toNumber from $fromNumber")
         val uri = Uri.fromParts("tel", toNumber, null)
         try {
