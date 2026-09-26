@@ -28,13 +28,18 @@ unk() { echo "  [?]       $1"; unknown=$((unknown+1)); }
 
 echo "=== Device ==="
 echo "  model    : $(sh_ getprop ro.product.model)"
-echo "  board    : $(sh_ getprop ro.board.platform)"
+echo "  board    : $(sh_ getprop ro.product.board)   (Build.BOARD, what detect() matches)"
+echo "  platform : $(sh_ getprop ro.board.platform)"
 echo "  hardware : $(sh_ getprop ro.hardware)"
 echo "  android  : $(sh_ getprop ro.build.version.release)"
 echo "  vendor   : $(sh_ getprop ro.vendor.build.fingerprint)"
 echo
 
-if [ "$(sh_ getprop ro.hardware)" != "qcom" ]; then
+# Lowercased once and reused: DeviceProfile.detect() lowercases Build.HARDWARE,
+# and `case` is case-sensitive, so a raw value would not match the same arms.
+hw=$(sh_ getprop ro.hardware | tr '[:upper:]' '[:lower:]')
+
+if [ "$hw" != "qcom" ]; then
     echo "Not a Qualcomm device — stop here."
     echo "Injection needs incall_music and capture needs the in-call record"
     echo "session; neither exists outside the Qualcomm audio HAL.  A Samsung"
@@ -42,6 +47,26 @@ if [ "$(sh_ getprop ro.hardware)" != "qcom" ]; then
     echo "policy at all: three mixPorts (deep, fast, primary) and nothing else."
     exit 1
 fi
+
+has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+
+# Mirrors DeviceProfile.detect(), including the prop it matches on.  A device
+# whose board is already a named profile needs no new entry.
+detect_profile() {
+    b=$(sh_ getprop ro.product.board | tr '[:upper:]' '[:lower:]')
+    m=$(sh_ getprop ro.product.model | tr '[:upper:]' '[:lower:]')
+    if has "$b" exynos9820 || { has "$hw" exynos && has "$m" sm-g970; }; then
+        echo "exynos9820()"
+    elif has "$b" sm6150 || has "$b" sm7150; then
+        echo "sm6150()"
+    elif has "$hw" qcom || has "$hw" qualcomm; then
+        echo "genericQualcomm()"
+    elif has "$hw" exynos || has "$hw" samsung; then
+        echo "genericExynos()"
+    else
+        echo "generic()"
+    fi
+}
 
 if sh_ 'pm list features' | grep -q 'feature:android.hardware.telephony'; then
     ok "telephony hardware present"
@@ -112,9 +137,18 @@ echo
 echo "=== Verdict ==="
 if [ "$fail" -eq 0 ] && [ "$unknown" -eq 0 ]; then
     echo "  Fully supported on paper: $pass/$pass checks passed."
-    echo "  A DeviceProfile entry will still be needed — the mixer names are"
-    echo "  generic, but which front-end the playback track lands on is not."
-    echo "  The 'Mixer BEFORE/AFTER' lines logged around each call show it."
+    profile=$(detect_profile)
+    case "$profile" in
+        "sm6150()"|"exynos9820()")
+            echo "  DeviceProfile: already covered — detect() returns $profile."
+            ;;
+        *)
+            echo "  DeviceProfile: no tuned entry; detect() returns $profile."
+            echo "  The mixer names are generic, but which front-end the playback"
+            echo "  track lands on is not — the 'Mixer BEFORE/AFTER' lines logged"
+            echo "  around each call show it."
+            ;;
+    esac
 elif [ "$fail" -eq 0 ]; then
     echo "  Promising: $pass checks passed, $unknown could not be checked."
     echo "  Root the device and re-run for a definite answer."

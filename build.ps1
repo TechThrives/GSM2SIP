@@ -69,8 +69,12 @@ function Test-AndroidSdk {
         exit 1
     }
 
-    # Ensure local.properties exists
-    "sdk.dir=$($env:ANDROID_HOME -replace '\\','/')" | Set-Content -Path (Join-Path $ScriptDir "local.properties") -Encoding UTF8
+    # WriteAllText, not Set-Content -Encoding UTF8: on PS 5.1 that adds a BOM,
+    # which AGP reads as "<BOM>sdk.dir" and reports "SDK location not found".
+    [System.IO.File]::WriteAllText(
+        (Join-Path $ScriptDir "local.properties"),
+        "sdk.dir=$($env:ANDROID_HOME -replace '\\','/')`n"
+    )
     Write-Host "Android SDK: $env:ANDROID_HOME"
 }
 
@@ -226,6 +230,38 @@ function Build-Tinymix {
     Build-TinymixArch -GoArch "arm" -OutPath (Join-Path $ScriptDir "magisk\tinymix32")
 }
 
+function Stamp-ModuleProp {
+    # Magisk Manager compares module.prop's versionCode against the installed
+    # module's to decide if a zip is an update, and never reads the APK's own
+    # versionCode -- so a stale one here silently ships the old priv-app.
+    $gradlePath = Join-Path $ScriptDir "app\build.gradle.kts"
+    $propPath = Join-Path $ScriptDir "magisk\module.prop"
+
+    $gradle = Get-Content $gradlePath -Raw
+    # Loud failure: a wrong versionCode is the exact bug this prevents.
+    if ($gradle -notmatch 'versionCode\s*=\s*(\d+)') {
+        throw "Could not read versionCode from $gradlePath"
+    }
+    $versionCode = $Matches[1]
+    if ($gradle -notmatch 'versionName\s*=\s*"([^"]+)"') {
+        throw "Could not read versionName from $gradlePath"
+    }
+    $versionName = $Matches[1]
+
+    $stamped = Get-Content $propPath | ForEach-Object {
+        if ($_ -match '^versionCode=') { "versionCode=$versionCode" }
+        elseif ($_ -match '^version=') { "version=v$versionName" }
+        else { $_ }
+    }
+    # UTF-8 without BOM, LF endings: Magisk parses this file.
+    [System.IO.File]::WriteAllText(
+        $propPath,
+        (($stamped -join "`n") + "`n"),
+        (New-Object System.Text.UTF8Encoding $false)
+    )
+    Write-Host "module.prop: version=v$versionName versionCode=$versionCode (from build.gradle.kts)"
+}
+
 function Build-Magisk {
     Write-Host ""
     Write-Host "=== Building Magisk module ==="
@@ -238,6 +274,8 @@ function Build-Magisk {
     New-Item -ItemType Directory -Path $privAppDir -Force | Out-Null
     Copy-Item (Join-Path $ScriptDir "gateway.apk") (Join-Path $privAppDir "Gateway.apk") -Force
     Write-Host "Included APK as priv-app in Magisk module"
+
+    Stamp-ModuleProp
 
     $zipPath = Join-Path $ScriptDir "gateway-magisk.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }

@@ -27,14 +27,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * RTP session: handles bidirectional audio between speaker/mic and remote RTP endpoint.
  *
- * On S4 Mini (MSM8930), VOICE_DOWNLINK routes through the physical mic
- * (HAL usecase incall-rec-downlink → voice-handset-mic).  Speaker mode
- * plays GSM caller audio through the speaker; the mic picks it up.
- *
  * Audio path:
  * - Capture: VOICE_DOWNLINK via mic → gain boost → encode → RTP → SIP agent.
  * - Playback: RTP → decode → AudioTrack (usage from profile).
- *   MSM8930: USAGE_MEDIA → STREAM_MUSIC.  incall_music_enabled=true
+ *   Qualcomm: USAGE_MEDIA → STREAM_MUSIC.  incall_music_enabled=true
  *   injects STREAM_MUSIC into voice TX, bypassing modem AEC.
  *   Exynos 9820: USAGE_VOICE_COMMUNICATION → STREAM_VOICE_CALL.
  *   Samsung HAL may route this into the modem uplink directly.
@@ -116,13 +112,10 @@ class RtpSession(
     @Volatile private var latchedAddr: InetAddress? = null
     @Volatile private var latchedPort: Int = 0
 
-    // Jitter buffer for received packets.  Capacity 8 (160ms) absorbs
-    // network jitter without audible gaps.  The playback loop drains
-    // excess above 5 (100ms) to bound latency — acceptable for a GSM
-    // bridge that already has 100-200ms of inherent GSM latency.
-    // Previous capacity=3 was too aggressive: any slight jitter caused
-    // packet drops and choppy audio.
     /** Jitter buffer, in 20ms frames.
+     *
+     *  Depth is [JITTER_CAPACITY] frames; the playback loop sheds one frame
+     *  per cycle above [JITTER_HIGH_WATER] to bound latency.
      *
      *  Four frames was too tight to be workable.  Measured over a 33s call it
      *  sat at 3-4 — pinned at capacity — and logged 87 dropped frames *and* 90
@@ -160,8 +153,8 @@ class RtpSession(
     @Volatile var audioSourceName = "none"; private set
     @Volatile private var playbackUsageName = "MEDIA"
 
-    // Capture and playback rates may differ.  VOICE_CALL on MSM8930
-    // only initializes at 8 kHz; G.722 decoding outputs 16 kHz PCM.
+    // Capture and playback rates may differ.  Some Qualcomm parts only
+    // initialize VOICE_CALL at 8 kHz; G.722 decoding outputs 16 kHz PCM.
     private var captureRate = 8000
     private var playbackRate = 8000
 
@@ -268,8 +261,8 @@ class RtpSession(
     /**
      * Initialize AudioRecord and AudioTrack.
      *
-     * AudioRecord: Tries VOICE_DOWNLINK first (on S4 Mini this routes through
-     * the physical mic via incall-rec-downlink HAL usecase).
+     * AudioRecord: Tries VOICE_DOWNLINK first (on some parts this routes
+     * through the physical mic via the incall-rec-downlink HAL usecase).
      * AudioTrack: USAGE_MEDIA (STREAM_MUSIC) so that Qualcomm's
      * incall_music_enabled=true parameter injects it into voice TX (uplink).
      * USAGE_VOICE_COMMUNICATION maps to STREAM_VOICE_CALL which the HAL
@@ -305,8 +298,8 @@ class RtpSession(
         val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
 
         // VOICE_CALL (source 4): captures uplink+downlink mixed digitally.
-        // Best option on MSM8930 — if it initializes, it provides clean
-        // digital capture of the caller's voice.  Requires CAPTURE_AUDIO_OUTPUT.
+        // Where it initializes it gives the cleanest digital capture of the
+        // caller's voice.  Requires CAPTURE_AUDIO_OUTPUT.
         if (wideband) {
             // G.722: prefer 16kHz native capture — avoids upsampling artifacts
             // in the 4-8kHz upper band that cause AI agent false interruptions.
@@ -355,27 +348,16 @@ class RtpSession(
             configs.removeAll(downlink)
             configs.addAll(0, downlink)
         }
-        // VOICE_DOWNLINK (source 3): DEAD LAST — on MSM8930 it initializes
+        // VOICE_DOWNLINK (source 3): DEAD LAST — on some SoCs it initializes
         // successfully (STATE_INITIALIZED) but captures SILENCE because the
-        // Incall_Rec mixer controls don't exist on this SoC.  If it were
-        // earlier in the list, it would "win" over mic-based sources that
-        // actually work.  Kept only for devices where it genuinely works.
+        // Incall_Rec mixer controls don't exist.  If it were earlier in the
+        // list, it would "win" over mic-based sources that actually work.
+        // Kept only for devices where it genuinely works.
         if (!profile.voiceDownlinkWorks) {
             if (wideband) {
                 configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
             }
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
-
-        // Same preference as the fallback list, applied here too -- this is
-        // the list that picks the source a call actually opens on, and
-        // reordering only the fallback list left every call still starting on
-        // VOICE_CALL@16k and discovering it was dead ~11s later.  The agent
-        // heard silence for those 11 seconds of every call.
-        if (profile.preferVoiceRecognition) {
-            val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
-            configs.removeAll(vr)
-            configs.addAll(0, vr)
         }
 
         var record: AudioRecord? = null
@@ -457,7 +439,7 @@ class RtpSession(
         }
 
         // Profile-controlled playback usage:
-        // USAGE_MEDIA (default / MSM8930): Maps to STREAM_MUSIC.  Qualcomm's
+        // USAGE_MEDIA (default): Maps to STREAM_MUSIC.  Qualcomm's
         // incall_music_enabled=true injects STREAM_MUSIC into voice TX.
         // USAGE_VOICE_COMMUNICATION (Exynos 9820): Maps to STREAM_VOICE_CALL.
         // Samsung's HAL may route this into the modem uplink when a voice
@@ -465,13 +447,12 @@ class RtpSession(
         // USAGE_MEDIA only plays on the speaker without reaching the modem.
         //
         // IMPORTANT: Do NOT use PERFORMANCE_MODE_LOW_LATENCY here.
-        // Low-latency forces the HAL to use "low-latency-playback" usecase
-        // which maps to MultiMedia5.  On MSM8930 (Galaxy S4 Mini), only
-        // MultiMedia1 and MultiMedia2 have Incall_Music mixer controls.
-        // MultiMedia5 has no incall_music mixer, so audio plays on the
-        // earpiece but is NEVER injected into the modem uplink.
-        // Using default (deep-buffer-playback → MultiMedia1) ensures the
-        // Incall_Music Audio Mixer MultiMedia1 routes audio to the caller.
+        // Low-latency forces the HAL to use "low-latency-playback" usecase,
+        // which maps to MultiMedia5.  Where MultiMedia5 has no Incall_Music
+        // control, playback stays on the earpiece and never reaches the
+        // modem.  Measured on one MSM8930 front-end; sm6150 does have
+        // MultiMedia5 and sets it, so this is untested elsewhere — the
+        // deep-buffer default is the safe choice.
         val usage = when (profile.playbackUsage) {
             AudioAttributes.USAGE_MEDIA -> AudioAttributes.USAGE_MEDIA
             AudioAttributes.USAGE_VOICE_COMMUNICATION ->
@@ -721,14 +702,6 @@ class RtpSession(
                 configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
             }
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
-        if (profile.preferVoiceRecognition) {
-            // Ahead of everything, including VOICE_DOWNLINK: on these handsets
-            // it is the source that actually delivers a steady frame rate, and
-            // arriving steadily matters more than arriving digitally.
-            val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
-            configs.removeAll(vr)
-            configs.addAll(0, vr)
         }
         return configs.filterNot { it.source in silentSourceIds }
     }
@@ -1464,9 +1437,9 @@ class RtpSession(
         Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true) " +
             "routedTo=${track.routedDevice?.type}")
 
-        // Set incall_music_enabled=true AFTER AudioTrack.play(): the Qualcomm
-        // HAL on MSM8930 starts the incall-music usecase only once there is an
-        // active STREAM_MUSIC output.
+        // Set incall_music_enabled=true AFTER AudioTrack.play(): some Qualcomm
+        // HALs start the incall-music usecase only once there is an active
+        // STREAM_MUSIC output.
         //
         // Skipped where the profile already set it before the track existed.
         // Toggling it again here reconfigures the voice path and tears down the
@@ -1790,7 +1763,10 @@ class RtpSession(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             if (RootShell.recordAudioAllowed(probe)) {
-                Log.d(TAG, "appops RECORD_AUDIO still allow — nothing to do")
+                // The mode, not the word "allow": from API 36 it stays
+                // "foreground" and a capture drop is a capability problem, not
+                // a revoked grant, so this line is where you look first.
+                Log.d(TAG, "appops RECORD_AUDIO mode=${RootShell.recordAudioMode(probe)} — nothing to re-grant")
                 return
             }
             Log.w(TAG, "appops RECORD_AUDIO not allowed [$probe] — re-granting")
@@ -1863,14 +1839,6 @@ class RtpSession(
         }
     }
 
-    /**
-     * Log diagnostic info about capture capability:
-     * Phase 1: NSRC routing + bridge state
-     * Phase 2: mixer_paths.xml incall_music voice path definitions
-     * Phase 3: /proc/asound capture/playback PCM status
-     * Phase 6: Delayed NSRC re-check (t+5s)
-     * Phase 7: ALSA capture PCM probe (tinycap, if available)
-     */
     /**
      * Whether to run the full capture diagnostic sweep at call setup.
      *

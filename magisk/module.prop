@@ -1,6 +1,6 @@
 id=sip-gsm-gateway
-name=SIP-GSM Gateway Permissions
+name=GSM2SIP Gateway
 version=v1.2.0
-versionCode=373
+versionCode=425
 author=callagent
-description=Priv-app permissions (CAPTURE_AUDIO_OUTPUT, MODIFY_PHONE_STATE), auto-grant runtime permissions, audio config for SIP-GSM gateway
+description=Installs the GSM2SIP app as a privileged system app and prepares its audio path: grants CAPTURE_AUDIO_OUTPUT and the telephony privileges, lifts Android's audio concurrency limits so calls can be captured and agent audio injected, allows the app in Magisk's superuser policy, and deploys a tinymix matching the device ABI. It also tries to hide PermissionController, which is a no-op on Android 15+ where that package lives in an APEX. Reboot to activate.

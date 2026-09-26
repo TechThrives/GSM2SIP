@@ -1,6 +1,5 @@
 package com.callagent.gateway
 
-import android.media.AudioAttributes
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
@@ -125,7 +124,6 @@ data class DeviceProfile(
 
     /** Voice call stream volume as percentage of max (0=minimum non-zero).
      *  Controls the caller's voice volume on the speaker.
-     *  MSM8930: 0 (muted via tinymix muteVoiceRx).
      *  Exynos 9820: higher value needed for mic-based acoustic capture. */
     val voiceCallVolPercent: Int = 0,
 
@@ -156,21 +154,6 @@ data class DeviceProfile(
      *  pumps the room.  UNPROCESSED bypasses that chain. */
     val preferUnprocessedMic: Boolean = false,
 
-    /** Put VOICE_RECOGNITION at the head of the capture list.
-     *
-     *  For handsets where VOICE_CALL opens and reports a plausible level but
-     *  does not deliver frames at a steady 50/s.  That failure is invisible to
-     *  the silence detector -- there *is* audio, it simply arrives in bursts --
-     *  and the resulting gappy uplink reads to an AI agent's barge-in detector
-     *  as the caller interrupting, so it stops mid-sentence.  Measured on the
-     *  S4 Mini: VOICE_CALL@16k sent 1173 packets where 1676 arrived, while
-     *  VOICE_RECOGNITION on the same call sent 1650 of 1675.
-     *
-     *  The rest of the list is kept as fallback rather than pinning this one
-     *  source: if it ever fails to open, a call with no audio at all is worse
-     *  than a call on a second-choice source. */
-    val preferVoiceRecognition: Boolean = false,
-
     /** Ask AudioRecord to capture from the telephony RX device.
      *
      *  The mirror of [playbackToTelephonyTx].  Without it, capture on a device
@@ -195,9 +178,9 @@ data class DeviceProfile(
      *  AudioPolicyManager only offers the incall_music_uplink mixPort — the one
      *  routed to Telephony Tx — while incall_music_enabled is already true, so
      *  setting the parameter after play() leaves the track bound to the speaker
-     *  for its whole life.  MSM8930 wants the opposite order (its HAL starts
-     *  the incall-music usecase only once a STREAM_MUSIC output exists), which
-     *  is why this is per-profile rather than simply reordered. */
+     *  for its whole life.  Some Qualcomm HALs want the opposite order (they
+     *  start the incall-music usecase only once a STREAM_MUSIC output exists),
+     *  which is why this is per-profile rather than simply reordered. */
     val incallMusicBeforeTrack: Boolean = false,
 
     /** Open the playback track as stereo rather than mono.
@@ -392,21 +375,17 @@ data class DeviceProfile(
             Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
 
             return when {
-                // Samsung Galaxy S4 Mini (MSM8930 / WCD9304)
-                board.contains("msm8930") || hw.contains("qcom") && model.contains("gt-i919") ->
-                    msm8930()
-
                 // Samsung Galaxy S10e Exynos (Exynos 9820)
                 board.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
                     exynos9820()
 
                 // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
-                // e.g. Poco X3 NFC.  Same incall_music path as MSM8930 but a
-                // different codec, so the WCD9304 control names do not apply.
+                // e.g. Poco X3 NFC.  The WCD9304 control names some older
+                // Qualcomm parts use do not exist here, so they are not set.
                 board.contains("sm6150") || board.contains("sm7150") ->
                     sm6150()
 
-                // Generic Qualcomm — try incall_music, skip WCD9304-specific controls
+                // Generic Qualcomm — try incall_music, skip codec-specific controls
                 hw.contains("qcom") || hw.contains("qualcomm") ->
                     genericQualcomm()
 
@@ -422,158 +401,6 @@ data class DeviceProfile(
         }
 
         // ── Known device profiles ──
-
-        /** Samsung Galaxy S4 Mini (MSM8930 / WCD9304 codec) */
-        fun msm8930() = DeviceProfile(
-            name = "MSM8930 (S4 Mini)",
-            preferVoiceRecognition = true,
-            mixerSetupCmd = buildString {
-                // Voice Rx mute (silence speaker)
-                append("tinymix 'Voice Rx Device Mute' 1 2>/dev/null; ")
-                append("tinymix 'Voice Rx Mute' 1 2>/dev/null; ")
-                append("tinymix 'Voip Rx Device Mute' 1 2>/dev/null; ")
-                // Voice Tx: keep open for incall_music injection
-                append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
-                // Full mic mute: disconnect DEC MUX, zero DEC/ADC volumes, cut MICBIAS
-                append("tinymix 'DEC1 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'DEC2 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'DEC3 MUX' 'ZERO' 2>/dev/null; ")
-                append("tinymix 'DEC1 Volume' 0 2>/dev/null; ")
-                append("tinymix 'DEC2 Volume' 0 2>/dev/null; ")
-                append("tinymix 'DEC3 Volume' 0 2>/dev/null; ")
-                append("tinymix 'DEC4 Volume' 0 2>/dev/null; ")
-                append("tinymix 'ADC1 Volume' 0 2>/dev/null; ")
-                append("tinymix 'ADC2 Volume' 0 2>/dev/null; ")
-                append("tinymix 'ADC3 Volume' 0 2>/dev/null; ")
-                append("tinymix 'MICBIAS1 CAPLESS Switch' 0 2>/dev/null; ")
-                append("tinymix 'MICBIAS2 CAPLESS Switch' 0 2>/dev/null; ")
-                append("tinymix 'MICBIAS3 CAPLESS Switch' 0 2>/dev/null; ")
-                append("tinymix 'Voice Tx Device Mute' 1 2>/dev/null; ")
-                // Disable echo reference
-                append("tinymix 291 0 2>/dev/null; ")
-                // Enable incall_music mixer
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
-                // Speaker codec-level mute
-                append("tinymix 'RX3 Digital Volume' 0 2>/dev/null; ")
-                append("tinymix 'SPK DRV Volume' 0 2>/dev/null; ")
-                append("tinymix 'Speaker Boost Volume' 0 2>/dev/null; ")
-                append("tinymix 'LINEOUT1 Volume' 0 2>/dev/null; ")
-                append("tinymix 'LINEOUT2 Volume' 0 2>/dev/null")
-            },
-            mixerRestoreCmd = buildString {
-                // Unmute voice RX (restore speaker audio)
-                append("tinymix 'Voice Rx Device Mute' 0 2>/dev/null; ")
-                append("tinymix 'Voice Rx Mute' 0 2>/dev/null; ")
-                append("tinymix 'Voip Rx Device Mute' 0 2>/dev/null; ")
-                // Unmute voice TX (was muted during bridge to block physical mic).
-                // CRITICAL: must restore to 0 or subsequent calls can't set up
-                // the voice TX path (S4 Mini: "second call never answered").
-                append("tinymix 'Voice Tx Device Mute' 0 2>/dev/null; ")
-                append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
-                // Reset incall_music mixer — prevents stale state on next call.
-                // HAL may not reset these automatically on call end.
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 0 2>/dev/null; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
-                // Restore mic path: DEC MUX back to ADC, MICBIAS re-enabled
-                append("tinymix 'DEC1 MUX' 'ADC1' 2>/dev/null; ")
-                append("tinymix 'DEC2 MUX' 'ADC2' 2>/dev/null; ")
-                append("tinymix 'DEC3 MUX' 'ADC3' 2>/dev/null; ")
-                append("tinymix 'MICBIAS1 CAPLESS Switch' 1 2>/dev/null; ")
-                append("tinymix 'MICBIAS2 CAPLESS Switch' 1 2>/dev/null; ")
-                append("tinymix 'MICBIAS3 CAPLESS Switch' 1 2>/dev/null; ")
-                // Restore volumes
-                append("tinymix 'DEC1 Volume' 84 2>/dev/null; ")
-                append("tinymix 'DEC2 Volume' 84 2>/dev/null; ")
-                append("tinymix 'DEC3 Volume' 84 2>/dev/null; ")
-                append("tinymix 'DEC4 Volume' 84 2>/dev/null; ")
-                append("tinymix 'ADC1 Volume' 100 2>/dev/null; ")
-                append("tinymix 'ADC2 Volume' 100 2>/dev/null; ")
-                append("tinymix 'ADC3 Volume' 12 2>/dev/null; ")
-                append("tinymix 'RX3 Digital Volume' 68 2>/dev/null; ")
-                append("tinymix 'SPK DRV Volume' 8 2>/dev/null; ")
-                append("tinymix 'Speaker Boost Volume' 5 2>/dev/null; ")
-                append("tinymix 'LINEOUT1 Volume' 100 2>/dev/null; ")
-                append("tinymix 'LINEOUT2 Volume' 100 2>/dev/null; ")
-                // Restore echo reference
-                append("tinymix 291 1 2>/dev/null")
-            },
-            mixerIncallMusicCmd = buildString {
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
-                append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
-                append("sleep 1; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
-                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null")
-            },
-            mixerVerifyCmd = buildString {
-                append("echo -n 'VoiceRxDevMute='; tinymix 'Voice Rx Device Mute' 2>&1; ")
-                append("echo -n 'VoiceTxMute='; tinymix 'Voice Tx Mute' 2>&1; ")
-                append("echo -n 'IncallMM1='; tinymix 'Incall_Music Audio Mixer MultiMedia1' 2>&1; ")
-                append("echo -n 'IncallMM2='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>&1")
-            },
-            // UNVERIFIED — the S4 Mini was not available to test against.
-            // voice_extn is generic Qualcomm code, so the in-call recording
-            // gate (voice_is_call_state_active) is very likely the same one
-            // that kept SM6150 on acoustic capture.  This profile captures the
-            // caller through the microphone today for what may be exactly that
-            // reason.  The HAL rejects VSIDs it does not know, so listing the
-            // full set is harmless; VOICE_SESSION (10c01000) is the one an
-            // MSM8930-era HAL would actually use.
-            halCallActiveVsids = listOf("10c01000", "10dc1000", "11c05000"),
-            // Calibrated, not arbitrary: above roughly this the injected
-            // stream clips.  Raising it to index 5/15 was tried on a live call
-            // and made no audible difference at the far end — the incall_music
-            // path does not take its level from the STREAM_MUSIC index — so
-            // loudness has to come from playbackGain or the agent itself.
-            musicVolPercent = 14,
-            // Capture is relayed unaltered — the modem's level is already
-            // healthy and sm6150 does the same.  Playback keeps a x2: the far
-            // end reported the agent as quiet without it, and the STREAM_MUSIC
-            // index turned out not to drive the incall_music level at all, so
-            // this is the only lever left short of raising the agent itself.
-            captureGain = 1,
-            playbackGain = 2,
-            // Measured on live calls: the modem's silence floor sits at
-            // rawCapRMS 6-174, while speech runs 471-4132.  At 500 the gate was
-            // biting into speech — a frame at 471 was zeroed outright — and the
-            // hard on/off at the threshold was audible as chatter at the starts
-            // and ends of words.  100 keeps the gate almost entirely out of the
-            // way, at the cost of relaying some of the modem's own hiss.
-            noiseGateThreshold = 100,
-            echoGateThreshold = 300,
-            doubleTalkRatio = 1.5f,
-            // Nothing to cancel: capture is AudioSource.VOICE_CALL straight off
-            // the modem and playback is injected digitally through
-            // incall_music, so the handset's speaker and microphone are not in
-            // the path and playback cannot reach the capture side.  Left on
-            // (the default) the echo gate and double-talk logic ran on every
-            // frame and did nothing but discard the caller whenever the agent
-            // spoke — the counters bore this out, gates:echo climbing steadily
-            // through a call where no acoustic echo was possible.
-            playbackLeaksIntoCapture = false,
-            // AudioSource.VOICE_CALL is uplink AND downlink mixed, and the
-            // uplink is where incall_music injects the agent — so the agent's
-            // own voice came straight back to it as if the caller had spoken,
-            // and its barge-in detector cut every phrase in half while the
-            // caller was silent.  Confirmed from the server's recordings.
-            //
-            // Downlink alone is the caller.  These are the two front-end
-            // switches the HAL's incall-rec paths use, and they have to be set
-            // after startRecording(): opening the capture stream reprograms
-            // that front-end, discarding anything written earlier.
-            mixerCaptureCmd = buildString {
-                append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 1 2>/dev/null; ")
-                append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
-                append("echo -n 'VOC_REC_DL='; tinymix 'MultiMedia1 Mixer VOC_REC_DL' 2>&1; ")
-                append("echo -n 'VOC_REC_UL='; tinymix 'MultiMedia1 Mixer VOC_REC_UL' 2>&1")
-            },
-            requireSpeakerMode = true,
-            incallMusicParam = "incall_music_enabled",
-            voiceDownlinkWorks = false,
-            routeChangeDelayMs = 700,
-            appopsPropagationMs = 500,
-        )
 
         /** Samsung Galaxy S10e (Exynos 9820 / Cirrus Logic CS47L93 Madera codec)
          *
@@ -708,16 +535,16 @@ data class DeviceProfile(
          *
          *  Present and used here:
          *    Incall_Music Audio Mixer MultiMedia1/2/5/9  — digital injection
-         *      of STREAM_MUSIC into the modem uplink, the same mechanism the
-         *      S4 Mini uses and the one the Exynos S10e turned out to lack.
+         *      of STREAM_MUSIC into the modem uplink, and the one mechanism the
+         *      Exynos S10e turned out to lack.
          *    MultiMedia{1,4,8,9} Mixer VOC_REC_DL/UL     — in-call capture.
          *      The HAL is supposed to set these when an app opens
          *      AudioSource.VOICE_CALL; enabling them explicitly costs nothing
          *      and covers the case where it does not.
          *    Voice Rx Device Mute / Voice Tx Mute / Voice Tx Device Mute
          *
-         *  Absent (WCD9304-only, so nothing from the MSM8930 profile that
-         *  touches them applies): MICBIAS* CAPLESS Switch, RX3 Digital Volume,
+         *  Absent (WCD9304-era controls, not present on this codec):
+         *  MICBIAS* CAPLESS Switch, RX3 Digital Volume,
          *  SPK DRV Volume, LINEOUT* Volume, Voice Rx Mute, Voip Rx Device Mute.
          *
          *  Note the Voice* controls are write-only on this firmware — reading
@@ -758,7 +585,7 @@ data class DeviceProfile(
                 // MultiMedia5 is the one that matters here: with a voice call
                 // up, the AudioTrack lands on MultiMedia5 (visible as
                 // "TERT_MI2S_RX Audio Mixer MultiMedia5: On"), not MultiMedia1/2
-                // the way it does on MSM8930.  Opening only MM1/MM2 left the
+                // the way older Qualcomm front-ends do.  Opening only MM1/MM2 left the
                 // agent's audio going to the speaker instead of the uplink, so
                 // the caller heard nothing from the agent — only their own
                 // voice echoing back off the mic.  All four available ports are

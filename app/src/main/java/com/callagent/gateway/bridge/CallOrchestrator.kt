@@ -804,7 +804,7 @@ class CallOrchestrator(
                 try {
                     // Always disconnect — not just when ACTIVE.  If the SIP
                     // call fails before GSM is answered, the ringing GSM call
-                    // was left dangling (S4 Mini: "second call never answered").
+                    // is left dangling and the next call never gets answered.
                     // Call.disconnect() works for RINGING, DIALING, and ACTIVE.
                     call.disconnect()
                 } catch (e: Exception) {
@@ -886,7 +886,7 @@ class CallOrchestrator(
                 "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
             )
             if (RootShell.recordAudioAllowed(probe)) {
-                Log.i(TAG, "appops RECORD_AUDIO already allow — skipping grant")
+                Log.i(TAG, "appops RECORD_AUDIO mode=${RootShell.recordAudioMode(probe)} — skipping grant")
                 return
             }
             Log.w(TAG, "appops RECORD_AUDIO not allowed [$probe] — granting")

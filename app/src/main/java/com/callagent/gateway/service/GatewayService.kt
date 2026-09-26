@@ -71,9 +71,6 @@ class GatewayService : Service() {
     @Volatile private var outgoingCalls = 0
     @Volatile private var outgoingDurationSec = 0L
     @Volatile private var currentCallStart = 0L
-    @Volatile private var currentAttemptStart = 0L
-    @Volatile private var currentCallIncoming = true
-    @Volatile private var currentCallNumber = ""
 
     /** When the call first appeared, bridged or not.
      *
@@ -82,6 +79,9 @@ class GatewayService : Service() {
      *  rejected, an outbound number that never connected, a caller who hung up
      *  while it was ringing — used to leave no trace in the log at all.  Those
      *  are the calls most worth having a record of. */
+    @Volatile private var currentAttemptStart = 0L
+    @Volatile private var currentCallIncoming = true
+    @Volatile private var currentCallNumber = ""
 
     /** Prevents concurrent startGateway / reconnect threads */
     private val initializing = AtomicBoolean(false)
@@ -819,14 +819,6 @@ class GatewayService : Service() {
         }
     }
 
-    /**
-     * Tell the server what has become of a message.
-     *
-     * Two reports at most: one when the network has taken it (or refused it),
-     * and one when the delivery report arrives.  Carriers that do not return
-     * status reports simply never produce the second, which is why the first
-     * is not held back waiting for it.
-     */
     /** Re-report anything the server has not acknowledged yet.  A report that
      *  was refused or lost is no less true for it. */
     private fun sweepOutboxReports() {
@@ -844,6 +836,14 @@ class GatewayService : Service() {
         thread(name = "sms-report") { reportOutboxNow(id) }
     }
 
+    /**
+     * Tell the server what has become of a message.
+     *
+     * Two reports at most: one when the network has taken it (or refused it),
+     * and one when the delivery report arrives.  Carriers that do not return
+     * status reports simply never produce the second, which is why the first
+     * is not held back waiting for it.
+     */
     private fun reportOutboxNow(id: String) {
         run {
             val sms = SmsOutbox.get(this, id) ?: return
@@ -1764,8 +1764,9 @@ class GatewayService : Service() {
             )
             val elapsed = System.currentTimeMillis() - t0
             val allowed = RootShell.recordAudioAllowed(result)
-            Log.i(TAG, "appops RECORD_AUDIO: [$result] ok=$allowed (${elapsed}ms)")
-            broadcastLog("appops RECORD_AUDIO: ok=$allowed (${elapsed}ms)")
+            val mode = RootShell.recordAudioMode(result)
+            Log.i(TAG, "appops RECORD_AUDIO: [$result] mode=$mode ok=$allowed (${elapsed}ms)")
+            broadcastLog("appops RECORD_AUDIO: mode=$mode ok=$allowed (${elapsed}ms)")
 
             if (!allowed) {
                 val fb = RootShell.execForOutput(
@@ -1851,13 +1852,6 @@ class GatewayService : Service() {
                 timeZone = java.util.TimeZone.getTimeZone("UTC")
             }
 
-        /**
-         * Ask the running gateway to forward whatever SMS are queued.
-         *
-         * Called from the SMS receiver, which has already put the message on
-         * disk — so if the service is not up, or is killed on the way, nothing
-         * is lost: the queue is flushed again as soon as SIP registers.
-         */
         /** A send result or delivery report landed — let the service tell the
          *  server about it. */
         fun reportSmsProgress(context: Context, id: String) {
@@ -1872,6 +1866,13 @@ class GatewayService : Service() {
             }
         }
 
+        /**
+         * Ask the running gateway to forward whatever SMS are queued.
+         *
+         * Called from the SMS receiver, which has already put the message on
+         * disk — so if the service is not up, or is killed on the way, nothing
+         * is lost: the queue is flushed again as soon as SIP registers.
+         */
         fun deliverQueuedSms(context: Context) {
             val intent = Intent(context, GatewayService::class.java).apply {
                 action = ACTION_SMS_FLUSH

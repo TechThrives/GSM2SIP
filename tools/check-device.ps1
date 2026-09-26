@@ -53,7 +53,8 @@ function Unk {
 
 Write-Host "=== Device ==="
 Write-Host "  model    : $(Sh 'getprop ro.product.model')"
-Write-Host "  board    : $(Sh 'getprop ro.board.platform')"
+Write-Host "  board    : $(Sh 'getprop ro.product.board')   (Build.BOARD, what detect() matches)"
+Write-Host "  platform : $(Sh 'getprop ro.board.platform')"
 Write-Host "  hardware : $(Sh 'getprop ro.hardware')"
 Write-Host "  android  : $(Sh 'getprop ro.build.version.release')"
 Write-Host "  vendor   : $(Sh 'getprop ro.vendor.build.fingerprint')"
@@ -65,6 +66,18 @@ if ($hw -ne "qcom") {
     Write-Host "Injection needs incall_music and capture needs the in-call record"
     Write-Host "session; neither exists outside the Qualcomm audio HAL."
     exit 1
+}
+
+# Mirrors DeviceProfile.detect(), including the prop it matches on. A device
+# whose board is already a named profile needs no new entry.
+function Get-DetectedProfile {
+    $b = (Sh 'getprop ro.product.board').ToLower()
+    $m = (Sh 'getprop ro.product.model').ToLower()
+    if ($b -like "*exynos9820*" -or ($script:hw -like "*exynos*" -and $m -like "*sm-g970*")) { return "exynos9820()" }
+    if ($b -like "*sm6150*" -or $b -like "*sm7150*") { return "sm6150()" }
+    if ($script:hw -like "*qcom*" -or $script:hw -like "*qualcomm*") { return "genericQualcomm()" }
+    if ($script:hw -like "*exynos*" -or $script:hw -like "*samsung*") { return "genericExynos()" }
+    return "generic()"
 }
 
 $features = Sh 'pm list features'
@@ -165,7 +178,15 @@ Write-Host ""
 Write-Host "=== Verdict ==="
 if ($fail -eq 0 -and $unknown -eq 0) {
     Write-Host "  Fully supported on paper: $pass/$pass checks passed."
-    Write-Host "  A DeviceProfile entry will still be needed."
+    $profile = Get-DetectedProfile
+    if ($profile -eq "sm6150()" -or $profile -eq "exynos9820()") {
+        Write-Host "  DeviceProfile: already covered - detect() returns $profile."
+    } else {
+        Write-Host "  DeviceProfile: no tuned entry; detect() returns $profile."
+        Write-Host "  The mixer names are generic, but which front-end the playback"
+        Write-Host "  track lands on is not - the 'Mixer BEFORE/AFTER' lines logged"
+        Write-Host "  around each call show it."
+    }
 } elseif ($fail -eq 0) {
     Write-Host "  Promising: $pass checks passed, $unknown could not be checked."
     Write-Host "  Root the device and re-run for a definite answer."

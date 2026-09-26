@@ -426,8 +426,8 @@ object GsmCallManager {
                     // v2.8.50: Samsung Exynos HAL interprets mic mute as "mute
                     // entire voice uplink to modem", which blocks NSRC-injected
                     // AudioTrack audio from reaching the caller.
-                    // MSM8930: mic muting is handled at ALSA level (DEC MUX=ZERO,
-                    // MICBIAS=0) in mixerSetupCmd — no need for API-level mute.
+                    // Profiles that do not silence the handset can still be
+                    // holding a mute left by an earlier call, so clear it.
                     // Profiles that silence the handset re-mute in
                     // enforceVolumes() immediately below.
                     if (!profile.silenceLocalAudio) {
@@ -475,10 +475,12 @@ object GsmCallManager {
      *  and from RtpSession as a secondary safeguard. */
     fun enforceVolumes(am: AudioManager) {
         // Clear any stale ADJUST_MUTE flag from a previous call.
-        // CRITICAL: Do NOT use ADJUST_MUTE on STREAM_VOICE_CALL — on
-        // MSM8930 it kills the incall_music injection path, preventing
-        // the agent's audio from reaching the GSM caller.  Speaker
-        // silencing is handled by muteVoiceRx() at the ALSA mixer level.
+        // The two silencing routes below are not interchangeable: the HAL
+        // overwrites ALSA voice mutes when it programs the call path, so
+        // silenceLocalAudio profiles mute through AudioManager instead.  The
+        // removed MSM8930 profile was the opposite case — its HAL dropped
+        // incall_music injection under ADJUST_MUTE, so it had to use ALSA.
+        // That is why this is per-profile and not one rule.
         try {
             am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
         } catch (e: SecurityException) {
@@ -506,8 +508,8 @@ object GsmCallManager {
         }
 
         // Voice call volume: controls caller's voice on speaker.
-        // MSM8930: minimum (1) — speaker silenced by muteVoiceRx via tinymix.
-        // Exynos 9820: 80% — no muteVoiceRx, need loud speaker for mic capture.
+        // Exynos 9820: 80% — no mixer-level speaker mute, so it needs a loud
+        // speaker for the acoustic mic capture to hear the caller.
         // Volume=0 can confuse audio policy into treating call as inactive.
         try {
             val vcVol = if (profile.voiceCallVolPercent > 0) {

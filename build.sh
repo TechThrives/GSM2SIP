@@ -73,7 +73,15 @@ check_gradle_wrapper() {
         echo "Downloading Gradle wrapper..."
         mkdir -p "$SCRIPT_DIR/gradle/wrapper"
 
-        local GRADLE_VER="8.5"
+        # Read the version from the wrapper properties: AGP 9.0 needs Gradle
+        # 9.1+, so a hardcoded one could rebuild a wrapper this build rejects.
+        local GRADLE_VER
+        GRADLE_VER=$(sed -n 's|.*gradle-\([0-9][0-9.]*\)-bin\.zip.*|\1|p' \
+            "$SCRIPT_DIR/gradle/wrapper/gradle-wrapper.properties" | head -1)
+        if [ -z "$GRADLE_VER" ]; then
+            echo "ERROR: cannot determine the Gradle version from gradle-wrapper.properties" >&2
+            exit 1
+        fi
         local GRADLE_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
 
         curl -fsSL "$GRADLE_URL" -o /tmp/gradle-dist.zip
@@ -171,8 +179,47 @@ build_tinymix() {
     # that contain `long`: an arm64 binary talks a different ioctl ABI than an
     # armeabi-v7a one, and neither works on the other's kernel.  install.sh
     # picks the matching one at flash time.
-    build_tinymix_arch arm64 "ARM aarch64" "$SCRIPT_DIR/magisk/tinymix"
-    build_tinymix_arch arm   "ELF 32-bit.*ARM" "$SCRIPT_DIR/magisk/tinymix32"
+    #
+    # `|| true`: a tinymix that will not build is survivable — the module still
+    # flashes, only the mixer controls go unused — but `set -e` would abort.
+    build_tinymix_arch arm64 "ARM aarch64" "$SCRIPT_DIR/magisk/tinymix" || true
+    build_tinymix_arch arm   "ELF 32-bit.*ARM" "$SCRIPT_DIR/magisk/tinymix32" || true
+}
+
+# ── Stamp module.prop from the app version ───────────
+#
+# Magisk Manager compares module.prop's versionCode against the installed
+# module's to decide if a zip is an update, and never reads the APK's own
+# versionCode -- so a stale one here silently ships the old priv-app.
+stamp_module_prop() {
+    local gradle="$SCRIPT_DIR/app/build.gradle.kts"
+    local prop="$SCRIPT_DIR/magisk/module.prop"
+
+    local vc vn
+    vc=$(sed -n 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$gradle" | head -1)
+    vn=$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$gradle" | head -1)
+
+    # Loud failure: a wrong versionCode is the exact bug this prevents.
+    if [ -z "$vc" ] || [ -z "$vn" ]; then
+        echo "ERROR: could not read versionCode/versionName from $gradle" >&2
+        exit 1
+    fi
+
+    # Line by line, not `sed -i` (needs an arg on BSD).  Re-emitting every line
+    # keeps the file uniformly LF with a trailing newline.
+    local tmp line
+    tmp=$(mktemp)
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        line=${line#$'\ufeff'}   # match Stamp-ModuleProp, which drops any BOM
+        case "$line" in
+            versionCode=*) printf 'versionCode=%s\n' "$vc" ;;
+            version=*)     printf 'version=v%s\n' "$vn" ;;
+            *)              printf '%s\n' "$line" ;;
+        esac
+    done < "$prop" > "$tmp"
+    mv "$tmp" "$prop"
+    echo "module.prop: version=v$vn versionCode=$vc (from build.gradle.kts)"
 }
 
 build_magisk() {
@@ -189,6 +236,8 @@ build_magisk() {
     mkdir -p "$SCRIPT_DIR/magisk/system/priv-app/Gateway"
     cp "$SCRIPT_DIR/gateway.apk" "$SCRIPT_DIR/magisk/system/priv-app/Gateway/Gateway.apk"
     echo "Included APK as priv-app in Magisk module"
+
+    stamp_module_prop
 
     cd "$SCRIPT_DIR/magisk"
     rm -f "$SCRIPT_DIR/gateway-magisk.zip"
@@ -211,7 +260,10 @@ install_to_device() {
     fi
 
     local COUNT
-    COUNT=$(adb devices 2>/dev/null | grep -c "device$")
+    # `|| true`: grep -c exits 1 on zero matches and a bare assignment inherits
+    # that, so `set -e` would abort here on a machine with no adb — after a
+    # perfectly good build.
+    COUNT=$(adb devices 2>/dev/null | grep -c "device$" || true)
     if [ "${COUNT:-0}" -gt 1 ]; then
         echo ""
         echo "$COUNT devices connected — refusing to guess which one to install to."

@@ -13,20 +13,17 @@ import java.nio.ByteBuffer
 object StunClient {
     private const val TAG = "StunClient"
 
-    // STUN servers — telecom-friendly servers first (port 3478)
+    // Public STUN servers, each verified live with a real Binding Request
+    // returning XOR-MAPPED-ADDRESS.  All on 3478, the IANA-registered port.
+    // Every entry in the previous list is now dead.  Deliberately institutional
+    // hosts only: a lapsed consumer domain would hand our source IP to whoever
+    // holds it next, free to return a bogus reflexive address into the SDP.
     private val STUN_SERVERS = listOf(
-        "stun.counterpath.com" to 3478,
-        "stun.services.mozilla.com" to 3478,
-        "stun.sipgate.net" to 3478,
-        "stun.jappix.com" to 3478,
-        "stun.1und1.de" to 3478,
-        "stun.gmx.net" to 3478,
-        "stun.ekiga.net" to 3478,
-        "stun.ideasip.com" to 3478,
-        "stun.iptel.org" to 3478,
-        "stun.rixtelecom.se" to 3478,
-        "stun.schlund.de" to 3478,
-        "stunserver.org" to 3478
+        "stun.l.google.com" to 3478,
+        "stun.cloudflare.com" to 3478,
+        "stun1.l.google.com" to 3478,
+        "stun.freeswitch.org" to 3478,
+        "stun.nextcloud.com" to 3478
     )
 
     private const val STUN_BINDING_REQUEST: Short = 0x0001

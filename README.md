@@ -28,9 +28,12 @@ Selectable in Settings, defaulting to **G.722 only** (wideband, 16 kHz):
 
 | Setting | Offered in SDP |
 |---|---|
-| G.722 only *(default)* | `9` |
-| G.722 preferred, G.711 allowed | `9 8 0` |
-| G.711 only | `8 0` |
+| G.722 only *(default)* | `9 101` |
+| G.722 preferred, G.711 allowed | `9 8 0 101` |
+| G.711 only | `8 0 101` |
+
+Payload `101` is `telephone-event` (DTMF), offered in every mode. The app does
+not consume in-band DTMF; it is advertised so the offer is complete.
 
 The default is G.722 alone because offering G.711 alongside it means servers
 routinely pick G.711 and every call ends up narrowband regardless of what both
@@ -48,20 +51,25 @@ remote actually offered rather than failing a call over a preference.
 both directions, entirely through the modem, with the handset's own microphone
 and speaker muted for the whole call.
 
-**The Galaxy S4 Mini is not supported by the current APK** because the app requires
-Android API 31 or newer.
-
 ### Choosing a device
 
 Support is a property of the **vendor image, not the chip**.  Everything the
 SM6150 profile relies on — the `incall_music` mixer, the `VOC_REC_*` capture
 routing, the `voice_extn` `vsid`/`call_state` interface — is generic Qualcomm
-audio, present across the msm8974→sm8xxx HAL family. 
+audio, and is confirmed working on two different generations from MSM8953
+through sm8xxx.
+
+Anything below Android 12 is out of scope — the APK requires API 31. The
+Galaxy S4 Mini (MSM8930) profile was removed on that basis; a handset it had
+matched now selects `Generic Qualcomm`, which does **not** silence the handset
+microphone. If one somehow runs this build, treat the echo as "unsupported",
+not "misconfigured".
 
 Check a candidate :
 
 ```bash
-tools/check-device.sh [adb-serial]
+tools/check-device.sh [adb-serial]     # Linux
+tools\check-device.ps1 [adb-serial]    # Windows
 ```
 
 The audio-policy check needs no root, so a phone can be vetted before rooting
@@ -73,6 +81,7 @@ What has actually been checked so far:
 | Device | SoC | Vendor | Result |
 |---|---|---|---|
 | Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
+| Redmi Note 7 Pro | Snapdragon 660 (MSM8953) | Xiaomi (LineageOS 16) | fully working, verified on live calls |
 | Galaxy S10e | Exynos 9820 | — | no path in either direction |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
@@ -111,7 +120,10 @@ That is why the gateway moved to a Qualcomm device.
 - **SIM**: SIM card with voice plan
 - **Network**: Stable WiFi connection
 - **Power**: Always connected to charger
-- **Build host**: Linux with JDK 17+
+- **Build host**: JDK 17+ (the minimum Android Gradle plugin 9.0 accepts), plus
+  the Android SDK with platform `android-34` and build-tools `36.0.0` (AGP 9.0's
+  default — it is not declared in the build file). Gradle 9.7.1 and AGP 9.0.0
+  are resolved by the wrapper, so no local Gradle install is needed.
 
 ## Download
 
@@ -123,11 +135,26 @@ Building from source is only needed to change something; see below.
 
 ## Build
 
+Linux:
+
 ```bash
 chmod +x build.sh
 ./build.sh          # debug build
 ./build.sh release  # release build
 ```
+
+Windows (PowerShell):
+
+```powershell
+.\build.ps1          # debug build
+.\build.ps1 release  # release build
+```
+
+Both scripts locate the Android SDK, write `local.properties`, build the APK and
+package the module. That file must have **no UTF-8 BOM** — with one, AGP reads
+the key as `﻿sdk.dir` and fails with `SDK location not found` even
+though the file looks right. The bundled scripts write it correctly; `ANDROID_HOME`
+also works and takes precedence.
 
 Outputs:
 - `gateway-magisk.zip` — Magisk module containing the APK, permissions, and audio tools (tinymix, tinycap). This is the only file you need to install.
@@ -179,23 +206,19 @@ there is nothing to write on the server side:
 
 ## The longer way: your own Asterisk
 
-The gateway is server-agnostic and registers like a SIP client. The repository's
-Docker deployment uses Asterisk `res_pjsip`, not the older `chan_sip` examples.
-Use the checked-in configuration as the canonical setup:
-
-- `infra/config/pjsip.conf` defines the `1001` gateway endpoint and
-  `message_context=sms-from-gsm`.
-- `infra/config/extensions.conf` reads mandatory `X-GSM-*` and `X-SMS-*`
-  headers and never routes from the Request-URI as a fallback.
-- `infra/config/websocket_client.conf` connects Asterisk media to the API.
+The gateway is server-agnostic and registers like a SIP client; nothing in this
+repository configures Asterisk for you. What follows is the routing contract the
+gateway implements.
 
 For incoming calls, the SIP Request-URI only addresses the peer. The server
 must use `X-GSM-From` and `X-GSM-To`, both strict `+E.164`, for routing.
 For outgoing calls, the API supplies the same pair through ARI/PJSIP variables.
 For SMS, `X-SMS-From` and `X-SMS-To` are mandatory and strict `+E.164`.
 
-Do not copy legacy `chan_sip` `SIPAddHeader()`, `accept_outofcall_message`,
-or Request-URI/`${EXTEN}` routing examples into this deployment.
+Do not use legacy `chan_sip` `SIPAddHeader()` or Request-URI/`${EXTEN}` routing.
+On `res_pjsip` the modern equivalents are `PJSIP_HEADER(add,…)` and
+`message_context=`; the `chan_sip` examples further down are kept only for
+reference and are not what the gateway is tested against.
 
 ### Outgoing calls through the gateway
 
@@ -381,6 +404,15 @@ submission. `X-SMS-Status` carries the SMSC's status value, or `unknown` when
 the report arrived without a readable PDU, so an inferred result never looks
 like a stated one.
 
+A report also carries `X-SMS-Smsc` (the handling service centre, from the
+delivery-report PDU) and `X-SMS-Encoding` (`GSM7`, `UCS2`, `8BIT`) — both only
+known once the message has gone out, so omitted when unknown. `X-SMS-At` is when
+the report was produced, not when the message was sent.
+
+A re-sent inbound message carries `X-SMS-Attempt`, counting from 2. It means the
+gateway never saw the response last time; the `X-SMS-Id` is unchanged, so it is
+the same message.
+
 Reports are retried like anything else: answer `200`/`202`, or the gateway
 sends them again, including after the next registration.
 
@@ -515,17 +547,36 @@ own number, until the allowance resets.
 
 ## Magisk Module
 
-The `gateway-magisk.zip` module does two critical things:
+The `gateway-magisk.zip` module carries the APK and prepares the device for it:
 
-1. **Disables audio concurrency restrictions** (`system.prop`):
-   - `voice.voip.conc.disabled=false` — allows VoIP audio during GSM calls
-   - `voice.record.conc.disabled=false` — allows audio recording during calls
-   - `voice.playback.conc.disabled=false` — allows audio playback during calls
-
-2. **Grants system-level permissions** (`privapp-permissions-gateway.xml`):
+1. **Installs the app as a privileged system app** (`system/priv-app/Gateway`)
+   and grants it the telephony privileges it needs
+   (`privapp-permissions-gateway.xml`):
    - `CAPTURE_AUDIO_OUTPUT` — capture audio from other sources
    - `MODIFY_PHONE_STATE` — control telephony
-   - `READ_PRECISE_PHONE_STATE` — detailed call state info
+   - `READ_PRIVILEGED_PHONE_STATE` — detailed call state info
+   - `CALL_PRIVILEGED` — place the outbound GSM leg
+
+2. **Lifts Android's audio concurrency limits** (`system.prop`), so a call can
+   be captured and agent audio injected at the same time:
+   - `voice.voip.conc.disabled=false` — VoIP audio during GSM calls
+   - `voice.record.conc.disabled=false` — audio recording during calls
+   - `voice.playback.conc.disabled=false` — audio playback during calls
+
+3. **Hides PermissionController** (`.replace` overlay). It otherwise sets the
+   `RECORD_AUDIO` app op to `MODE_FOREGROUND`, which denies `AudioRecord` to a
+   foreground service started at boot with no Activity in the foreground —
+   silently, with `AudioRecord` returning zeros. See Troubleshooting.
+
+4. **Prepares the runtime environment** on boot: grants the 11 runtime
+   permissions, seeds the Magisk superuser policy to allow so a headless
+   gateway never stalls on a prompt nobody is there to answer, lifts the
+   outgoing-SMS rate limit, and silences the default SMS app's notifications.
+
+5. **Deploys `tinymix`** matching the device ABI — see the ABI note under
+   [Build](#build).
+
+Reboot to activate.
 
 ## Troubleshooting
 

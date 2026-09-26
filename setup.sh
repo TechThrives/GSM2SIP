@@ -13,8 +13,7 @@ set -e
 
 ANDROID_SDK_DIR="/opt/android-sdk"
 CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-GRADLE_WRAPPER_URL="https://services.gradle.org/distributions/gradle-8.5-bin.zip"
-GRADLE_WRAPPER_JAR_VERSION="8.5"
+# The Gradle version is read from gradle-wrapper.properties, not pinned here.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -92,17 +91,19 @@ install_sdk_packages() {
     log "Accepting Android SDK licenses..."
     yes 2>/dev/null | sdkmanager --licenses > /dev/null 2>&1 || true
 
-    log "Installing SDK packages (platform 34, build-tools 34.0.0)..."
+    log "Installing SDK packages (platform 34, build-tools 36.0.0)..."
+    # stderr deliberately not redirected: `set -e` aborts on failure, and
+    # swallowing the reason leaves nothing to act on.
     sdkmanager --install \
         "platform-tools" \
         "platforms;android-34" \
-        "build-tools;34.0.0" \
-        > /dev/null 2>&1
+        "build-tools;36.0.0" \
+        > /dev/null
 
     log "Android SDK packages installed:"
     echo "  - platform-tools (adb)"
     echo "  - platforms;android-34"
-    echo "  - build-tools;34.0.0"
+    echo "  - build-tools;36.0.0"
 }
 
 # ── 4. Gradle wrapper ───────────────────────────────
@@ -123,6 +124,16 @@ setup_gradle_wrapper() {
             rm -f "gradle/wrapper/gradle-wrapper.jar"
         fi
     fi
+
+    # Read the version from the wrapper properties: AGP 9.0 needs Gradle 9.1+,
+    # so a hardcoded one could rebuild a wrapper this build rejects.
+    local GRADLE_WRAPPER_JAR_VERSION
+    GRADLE_WRAPPER_JAR_VERSION=$(sed -n 's|.*gradle-\([0-9][0-9.]*\)-bin\.zip.*|\1|p' \
+        "$SCRIPT_DIR/gradle/wrapper/gradle-wrapper.properties" | head -1)
+    if [ -z "$GRADLE_WRAPPER_JAR_VERSION" ]; then
+        err "Cannot determine the Gradle version from gradle/wrapper/gradle-wrapper.properties"
+    fi
+    local GRADLE_WRAPPER_URL="https://services.gradle.org/distributions/gradle-${GRADLE_WRAPPER_JAR_VERSION}-bin.zip"
 
     # Download Gradle distribution and use it to generate the wrapper
     log "Downloading Gradle $GRADLE_WRAPPER_JAR_VERSION distribution..."

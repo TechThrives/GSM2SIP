@@ -67,23 +67,29 @@ function Test-AndroidSdk {
         Err "Android SDK not found at $AndroidSdkDir. Install Android Studio or download command-line tools."
     }
 
-    # Ensure local.properties exists
+    # WriteAllText, not Set-Content -Encoding UTF8: on PS 5.1 that adds a BOM,
+    # which AGP reads as "<BOM>sdk.dir" and reports "SDK location not found".
     $sdkPath = $env:ANDROID_HOME -replace '\\', '/'
-    "sdk.dir=$sdkPath" | Set-Content -Path (Join-Path $ScriptDir "local.properties") -Encoding UTF8
+    [System.IO.File]::WriteAllText(
+        (Join-Path $ScriptDir "local.properties"),
+        "sdk.dir=$sdkPath`n"
+    )
     Log "Android SDK: $env:ANDROID_HOME"
 
-    # Check for required SDK components
-    $buildTools = Join-Path $env:ANDROID_HOME "build-tools\34.0.0\aapt2.exe"
+    # Check for required SDK components.  Build-tools must match AGP 9.0's
+    # minimum (36.0.0) -- an older one is present on many machines but the
+    # build will not use it.
+    $buildTools = Join-Path $env:ANDROID_HOME "build-tools\36.0.0\aapt2.exe"
     $platform = Join-Path $env:ANDROID_HOME "platforms\android-34\android.jar"
     if (-not (Test-Path $buildTools) -or -not (Test-Path $platform)) {
         Warn "Missing SDK components. Installing..."
         $sdkmanager = Join-Path $env:ANDROID_HOME "cmdline-tools\latest\bin\sdkmanager.bat"
         if (Test-Path $sdkmanager) {
             [string]::new([char]'y', 10) -split '' | Where-Object { $_ } | & "$sdkmanager" --licenses 2>$null | Out-Null
-            cmd /c "`"$sdkmanager`" --install `"platform-tools`" `"platforms;android-34`" `"build-tools;34.0.0`" 2>nul" | Out-Null
+            cmd /c "`"$sdkmanager`" --install `"platform-tools`" `"platforms;android-34`" `"build-tools;36.0.0`" 2>nul" | Out-Null
             Log "SDK components installed"
         } else {
-            Warn "sdkmanager not found. Install 'platform-tools', 'platforms;android-34', 'build-tools;34.0.0' manually."
+            Warn "sdkmanager not found. Install 'platform-tools', 'platforms;android-34', 'build-tools;36.0.0' manually."
         }
     } else {
         Log "SDK components OK"

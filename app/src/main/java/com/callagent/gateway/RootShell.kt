@@ -1,10 +1,12 @@
 package com.callagent.gateway
 
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.LinkedBlockingQueue
@@ -71,24 +73,52 @@ object RootShell {
     }
 
     /**
-     * True only if RECORD_AUDIO is really allowed.
-     * Checks "Uid mode:" first — it overrides the "RECORD_AUDIO:" package line.
-     * Old output.contains("allow") could see package allow while Uid was
-     * ignore, skipping the grant while capture stayed denied.
+     * The RECORD_AUDIO appops mode: "allow", "foreground", "default", "ignore",
+     * "deny", or "unknown".  Reported so a log can show the real mode instead of
+     * assuming "allow" — on API 36 it is "foreground" and stays there.
+     *
+     * "Uid mode:" wins over the package line, so a package "allow" cannot mask
+     * a UID "ignore".  The mode is found by scanning for the first known mode
+     * word, not by colon position: the two line shapes differ and the package
+     * line carries access history after the mode.
      */
-    fun recordAudioAllowed(output: String): Boolean {
-        for (line in output.lines()) {
-            if (line.trim().startsWith("Uid mode:")) {
-                return line.contains("allow", ignoreCase = true)
-            }
-        }
-        for (line in output.lines()) {
-            if (line.trim().startsWith("RECORD_AUDIO:")) {
-                return line.contains("allow", ignoreCase = true)
-            }
-        }
-        return output.contains("allow", ignoreCase = true)
+    fun recordAudioMode(output: String): String {
+        val lines = output.lines().map { it.trim() }
+        val line = lines.firstOrNull { it.startsWith("Uid mode:") }
+            ?: lines.firstOrNull { it.startsWith("RECORD_AUDIO:") }
+            ?: return "unknown"
+        return line.split(' ', ':', ';', '\t')
+            .firstOrNull { it.lowercase(Locale.ROOT) in APP_OPS_MODES }
+            ?.lowercase(Locale.ROOT)
+            ?: "unknown"
     }
+
+    /**
+     * True if the RECORD_AUDIO grant is intact, so the grant sequence has
+     * nothing to fix.  Only "allow" qualifies, plus "foreground" from API 36.
+     *
+     * A while-in-use op reports "foreground".  From API 36 AppOpService refuses
+     * setUidMode for it ("Ignored setUidMode call for runtime permission app
+     * op"), so the grant cannot change the mode and re-running it costs eight
+     * root commands a call.  The cost of accepting it there: capture stays
+     * conditional on the process holding PROCESS_CAPABILITY_FOREGROUND_MICROPHONE,
+     * so there is no re-grant recovery for a screen-off capture drop.  AOSP
+     * 14/15 setUidMode has no such guard, so below API 36 the upgrade to allow
+     * still happens and that recovery remains.
+     *
+     * "default" deliberately does not qualify: it means the op was never set
+     * through the app, and the grant sequence is what runs `pm grant`, so
+     * treating it as intact would skip the only thing that fixes it.
+     */
+    fun recordAudioAllowed(output: String, sdkInt: Int = Build.VERSION.SDK_INT): Boolean =
+        when (recordAudioMode(output)) {
+            "allow" -> true
+            "foreground" -> sdkInt >= 36
+            else -> false
+        }
+
+    /** Mode words `appops` accepts — AppOpsManager.MODE_NAMES. */
+    private val APP_OPS_MODES = setOf("allow", "foreground", "default", "ignore", "deny")
 
     private fun reportDenied(detail: String) {
         if (denied) return
