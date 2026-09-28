@@ -290,75 +290,11 @@ class RtpSession(
             else -> 16000  // G.722
         }
 
-        // Try telephony capture sources, then mic sources.
-        // When using G.722 (wideband), prefer 16kHz capture to avoid upsampling
-        // artifacts.  HD Voice (AMR-WB/EVS) provides native 16kHz audio.
-        val configs = mutableListOf<SourceConfig>()
-
+        // Try telephony capture sources, then mic sources.  buildCaptureConfigs
+        // owns the ordering: it was duplicated inline here, and the two copies
+        // could drift.
         val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
-
-        // VOICE_CALL (source 4): captures uplink+downlink mixed digitally.
-        // Where it initializes it gives the cleanest digital capture of the
-        // caller's voice.  Requires CAPTURE_AUDIO_OUTPUT.
-        if (wideband) {
-            // G.722: prefer 16kHz native capture — avoids upsampling artifacts
-            // in the 4-8kHz upper band that cause AI agent false interruptions.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        }
-        // Mic-based sources: in speaker mode, the physical mic picks up the
-        // caller's voice from the speaker.  This is acoustic coupling — not
-        // ideal but functional when digital capture sources fail.
-        // VOICE_RECOGNITION bypasses noise suppression that can mute call audio.
-        // VOICE_DOWNLINK ahead of the acoustic sources when the profile says
-        // it works here.  It captures the caller's voice digitally, off the
-        // modem downlink, which is what lets the physical mic stay muted — on
-        // the acoustic path the mic is the capture source, so the caller hears
-        // the room and the agent hears itself through the speaker.
-        if (profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
-        if (profile.preferUnprocessedMic) {
-            // Raw mic, ahead of the voice-tuned sources: no AEC, no noise
-            // suppression, no AGC.  When the caller reaches us as sound out of
-            // the phone's own speaker, those are all working against us.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED", 8000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.CAMCORDER, "CAMCORDER", 8000))
-        }
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
-
-        if (profile.voiceDownlinkWorks) {
-            // Where the modem downlink is capturable, it is the only source we
-            // want: VOICE_CALL mixes uplink AND downlink, and the uplink now
-            // carries the agent's own injected voice, so the agent hears itself
-            // folded into the caller — which is what the far end perceives as
-            // noise.  The downlink alone is the caller.  Acoustic sources stay
-            // behind it purely as a last resort.
-            configs.removeAll { it.source == MediaRecorder.AudioSource.VOICE_CALL }
-            val downlink = configs.filter {
-                it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
-            }
-            configs.removeAll(downlink)
-            configs.addAll(0, downlink)
-        }
-        // VOICE_DOWNLINK (source 3): DEAD LAST — on some SoCs it initializes
-        // successfully (STATE_INITIALIZED) but captures SILENCE because the
-        // Incall_Rec mixer controls don't exist.  If it were earlier in the
-        // list, it would "win" over mic-based sources that actually work.
-        // Kept only for devices where it genuinely works.
-        if (!profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
+        val configs = buildCaptureConfigs(wideband).toMutableList()
 
         var record: AudioRecord? = null
         var usedRate = 8000
@@ -652,20 +588,23 @@ class RtpSession(
     }
 
     /** Build the prioritized list of capture source configs, excluding
-     *  sources already detected as silent. */
+     *  sources already detected as silent.
+     *
+     *  The single definition of capture order.  Wideband (G.722) prefers
+     *  16kHz native capture: upsampling the 4-8kHz band caused false barge-in
+     *  from the agent. */
     private fun buildCaptureConfigs(wideband: Boolean): List<SourceConfig> {
         val configs = mutableListOf<SourceConfig>()
+
+        // VOICE_CALL (source 4): uplink+downlink mixed digitally, the cleanest
+        // capture where it initialises.  Needs CAPTURE_AUDIO_OUTPUT.
         if (wideband) {
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
         }
-        // VOICE_DOWNLINK ahead of the acoustic sources when the profile says
-        // it works here.  It captures the caller's voice digitally, off the
-        // modem downlink, which is what lets the physical mic stay muted — on
-        // the acoustic path the mic is the capture source, so the caller hears
-        // the room and the agent hears itself through the speaker.
+        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
+
+        // VOICE_DOWNLINK: the caller alone, off the modem.  Ahead of the mic
+        // sources only where it really works — see the reorder below.
         if (profile.voiceDownlinkWorks) {
             if (wideband) {
                 configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
@@ -673,9 +612,9 @@ class RtpSession(
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
         }
         if (profile.preferUnprocessedMic) {
-            // Raw mic, ahead of the voice-tuned sources: no AEC, no noise
+            // Raw mic ahead of the voice-tuned sources: no AEC, no noise
             // suppression, no AGC.  When the caller reaches us as sound out of
-            // the phone's own speaker, those are all working against us.
+            // the phone's own speaker, all three work against us.
             configs.add(SourceConfig(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED", 8000))
             configs.add(SourceConfig(MediaRecorder.AudioSource.CAMCORDER, "CAMCORDER", 8000))
         }
@@ -684,20 +623,19 @@ class RtpSession(
         configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
 
         if (profile.voiceDownlinkWorks) {
-            // Where the modem downlink is capturable, it is the only source we
-            // want: VOICE_CALL mixes uplink AND downlink, and the uplink now
-            // carries the agent's own injected voice, so the agent hears itself
-            // folded into the caller — which is what the far end perceives as
-            // noise.  The downlink alone is the caller.  Acoustic sources stay
-            // behind it purely as a last resort.
+            // VOICE_CALL mixes uplink AND downlink, and the uplink now carries
+            // the agent's own injected voice — the agent would hear itself
+            // folded into the caller.  The downlink alone is the caller.
             configs.removeAll { it.source == MediaRecorder.AudioSource.VOICE_CALL }
             val downlink = configs.filter {
                 it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
             }
             configs.removeAll(downlink)
             configs.addAll(0, downlink)
-        }
-        if (!profile.voiceDownlinkWorks) {
+        } else {
+            // DEAD LAST where it does not work: on some SoCs it initialises
+            // but captures silence, so earlier it would "win" over mic
+            // sources that do work.
             if (wideband) {
                 configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
             }
@@ -1673,13 +1611,11 @@ class RtpSession(
                     it.setParameters("${param}=true")
                 }
 
-                // Samsung Exynos: additional HAL params for incall music injection.
-                // Only when incallMusicParam is configured (empty = skip to avoid
-                // breaking VOICE_CALL capture).
-                // Samsung Exynos: additional HAL params for incall music.
-                // These are "best effort" — on Exynos 9820, no visible mixer
-                // effect is observed, but they may help on other Exynos devices.
-                if (profile.name.contains("Exynos") && param.isNotEmpty()) {
+                // Samsung Exynos: three extra HAL params.  "Best effort" — on
+                // Exynos 9820 no visible mixer effect was observed, but they
+                // may help on other Exynos devices.
+                val samsungAbox = profile.samsungAboxHalParams && param.isNotEmpty()
+                if (samsungAbox) {
                     it.setParameters("g_call_path=on")
                     it.setParameters("abox_incall_music=on")
                     it.setParameters("incall_music=1")
@@ -1688,7 +1624,7 @@ class RtpSession(
                 GsmCallManager.enforceVolumes(it)
 
                 val msg = "incall_music: param=${param.ifEmpty { "NONE" }}, mode=${it.mode}" +
-                    if (param.isNotEmpty() && profile.name.contains("Exynos")) " +g_call_path +abox_incall_music +incall_music=1" else ""
+                    if (samsungAbox) " +g_call_path +abox_incall_music +incall_music=1" else ""
                 Log.i(TAG, msg)
                 listener?.onRtpStats(msg)
             }

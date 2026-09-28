@@ -20,7 +20,13 @@ A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gate
 - **Outbound**: the SIP server sends an INVITE with `X-GSM-From: +<SIM-number>` and `X-GSM-To: +<destination>` → the phone dials the destination over GSM → audio is bridged back to SIP
 - **SMS**: messages arriving on any SIM are forwarded to the server as SIP MESSAGE, and the server can ask the gateway to send one and be told what became of it — see [SMS over SIP](#sms-over-sip)
 
-Audio flows through shared speaker/mic — both GSM and SIP audio run concurrently on the same hardware, enabled by a Magisk module that disables Android's audio concurrency restrictions.
+Audio is **digital in both directions** on a supported device: the agent's voice is
+injected into the GSM uplink through the `incall_music` mixer, and the caller is
+captured off the modem downlink. The phone's own microphone and speaker are muted
+for the duration of the call, so there is no acoustic echo path. A Magisk module
+disables Android's audio concurrency restrictions so capture and injection can run
+at the same time. Devices without that path (see [Supported Devices](#supported-devices))
+degrade to shared speaker/mic, which is lossy and prone to echo.
 
 ## Audio Codec
 
@@ -44,20 +50,29 @@ remote actually offered rather than failing a call over a preference.
 
 | Device | SoC | Agent → caller | Caller → agent | Status |
 |---|---|---|---|---|
-| Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** |
+| Redmi Note 7 Pro (`violet`) | Qualcomm SM6150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** |
+| Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital | digital | **fully working** |
 | Samsung Galaxy S10e | Exynos 9820, CS47L93 | no path | no path | not usable |
+| Nokia 6.1 Plus (`sdm636`) | Qualcomm Snapdragon 636/660 | no path | digital | not usable |
 
-**The Poco X3 NFC is the reference device and works fully**: G.722 wideband in
-both directions, entirely through the modem, with the handset's own microphone
+**The Redmi Note 7 Pro is the reference device and works fully**: G.722 wideband
+in both directions, entirely through the modem, with the handset's own microphone
 and speaker muted for the whole call.
+
+The Nokia 6.1 Plus is the useful negative case: its audio policy routes
+`Telephony Tx` but declares no `incall_music` mixPort to feed it, so there is
+nothing to inject into. A Qualcomm chip is necessary but not sufficient — the
+policy check in `tools/check-device` settles this without root.
 
 ### Choosing a device
 
 Support is a property of the **vendor image, not the chip**.  Everything the
 SM6150 profile relies on — the `incall_music` mixer, the `VOC_REC_*` capture
 routing, the `voice_extn` `vsid`/`call_state` interface — is generic Qualcomm
-audio, and is confirmed working on two different generations from MSM8953
-through sm8xxx.
+audio, confirmed working on two Snapdragon 600/700-series parts (MSM8953 and
+SM6150). The Nokia 6.1 Plus is Snapdragon 636/660 and shares the family, yet has
+no injection path at all, which is the point: check the policy, do not infer
+support from the model number.
 
 Anything below Android 12 is out of scope — the APK requires API 31. The
 Galaxy S4 Mini (MSM8930) profile was removed on that basis; a handset it had
@@ -65,24 +80,35 @@ matched now selects `Generic Qualcomm`, which does **not** silence the handset
 microphone. If one somehow runs this build, treat the echo as "unsupported",
 not "misconfigured".
 
-Check a candidate :
+Check a candidate:
 
 ```bash
 tools/check-device.sh [adb-serial]     # Linux
 tools\check-device.ps1 [adb-serial]    # Windows
 ```
 
+The two are independent implementations of the same checks and agree on the
+verdict, though the wording and colour differ by platform. Pass a serial
+whenever more than one device is attached; without one the script refuses
+rather than guessing. Exit `0` supported, `1` checked and not usable, `2`
+could not check — no device, wrong serial, or `unauthorized`, which is worth
+distinguishing from a real negative result.
+
 The audio-policy check needs no root, so a phone can be vetted before rooting
 it.  The HAL and mixer checks need Magisk with Superuser access set to
-"Apps and ADB".
+"Apps and ADB". A device with no `su` at all cannot run those two sections;
+that is a property of the handset, not a permission problem.
 
 What has actually been checked so far:
 
 | Device | SoC | Vendor | Result |
 |---|---|---|---|
-| Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
 | Redmi Note 7 Pro | Snapdragon 660 (MSM8953) | Xiaomi (LineageOS 16) | fully working, verified on live calls |
+| Redmi Note 7 Pro | Snapdragon 660 (MSM8953) | Xiaomi (Android 10) | policy checks pass; unrooted, so untested end to end |
+| Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
+| Nokia 6.1 Plus | Snapdragon 636/660 | HMD (LineageOS 14) | no `incall_music` mixPort — no injection path |
 | Galaxy S10e | Exynos 9820 | — | no path in either direction |
+| POCO C65 | MediaTek Helio G99 (mt6768) | Xiaomi (Android 15) | policy exposes an `incall_music` port; unrooted, so undetermined |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
 Qualcomm phones are plausible candidates — but the deciding factors live in the
@@ -91,6 +117,23 @@ still needs a `DeviceProfile` entry: the mixer names are generic, the front-end
 the playback track lands on is not, and the `Mixer BEFORE/AFTER` lines logged
 around each call show which one it is.  An unrecognised Qualcomm device falls
 back to `genericQualcomm()`.
+
+### Which profile gets selected
+
+`DeviceProfile.detect()` keys on the **SoC**, not the model, and reads it in
+this order: `ro.board.platform`, then `ro.soc.model`, then `ro.product.board`.
+`ro.board.platform` is first deliberately. `ro.product.board` is a build
+property the ROM vendor chooses, and the same Redmi Note 7 Pro reports `sm6150`
+on one ROM and `violet` — the product codename — on another. Matching on board
+alone silently demoted it from `sm6150()` to `genericQualcomm()`, which costs
+MultiMedia5, the `voice_extn` call_state announcement and the mic mute, while
+logging nothing: every mixer command ends in `2>/dev/null`, so a control that
+does not exist looks like one that worked. `ro.soc.*` is no substitute for
+`ro.board.platform` either — it only exists from Android 12, and was empty on
+the Android 10 build of the same phone.
+
+Selections are logged at start-up as `Detecting device: …` and
+`Selected profile: …`.
 
 Getting digital capture on a Qualcomm device depends on one thing that is easy
 to miss.  The HAL gates in-call recording — and the per-session voice mutes —
@@ -115,8 +158,11 @@ That is why the gateway moved to a Qualcomm device.
 
 ## Requirements
 
-- **Device**: Qualcomm-based Android phone with LineageOS + Magisk root
-  (developed against a Poco X3 NFC on Android 16)
+- **Device**: Qualcomm-based Android phone with Magisk root. The
+  `voice_extn` `call_state` behaviour described under
+  [Choosing a device](#choosing-a-device) was measured on LineageOS; another
+  ROM's HAL may not need the workaround, or may need more. Verified end to end
+  on a Redmi Note 7 Pro (LineageOS 16) and a Poco X3 NFC.
 - **SIM**: SIM card with voice plan
 - **Network**: Stable WiFi connection
 - **Power**: Always connected to charger
@@ -206,19 +252,22 @@ there is nothing to write on the server side:
 
 ## The longer way: your own Asterisk
 
-The gateway is server-agnostic and registers like a SIP client; nothing in this
-repository configures Asterisk for you. What follows is the routing contract the
-gateway implements.
+The gateway is server-agnostic and registers like a SIP client. This is the
+minimum a server has to provide:
 
-For incoming calls, the SIP Request-URI only addresses the peer. The server
-must use `X-GSM-From` and `X-GSM-To`, both strict `+E.164`, for routing.
-For outgoing calls, the API supplies the same pair through ARI/PJSIP variables.
-For SMS, `X-SMS-From` and `X-SMS-To` are mandatory and strict `+E.164`.
+| Requirement | Value |
+|---|---|
+| Registration | digest auth; the gateway registers as a single contact |
+| Codec | `G.722` (payload `9`); `101` telephone-event is always offered |
+| Inbound call routing | `X-GSM-From` and `X-GSM-To`, both strict `+E.164` |
+| SMS routing | `X-SMS-From` and `X-SMS-To`, both strict `+E.164` |
 
-Do not use legacy `chan_sip` `SIPAddHeader()` or Request-URI/`${EXTEN}` routing.
-On `res_pjsip` the modern equivalents are `PJSIP_HEADER(add,…)` and
-`message_context=`; the `chan_sip` examples further down are kept only for
-reference and are not what the gateway is tested against.
+The Request-URI only addresses the peer and is **never** used as a routing
+fallback — an INVITE missing either header is refused with `488`.
+
+Outbound, the server supplies the same pair through ARI/PJSIP variables; the
+gateway's own reports add `X-SMS-Id` and `X-SMS-Event` alongside the two
+routing headers.
 
 ### Outgoing calls through the gateway
 
@@ -517,7 +566,7 @@ own number, until the allowance resets.
 ```
 ┌─────────────────┐     GSM      ┌──────────────────┐
 │  Remote Caller   │◄───────────►│  Android Phone    │
-│  (local #)       │   voice     │  (Poco X3 + SIM)  │
+│  (local #)       │   voice     │  (Redmi + SIM)    │
 └─────────────────┘              │                    │
                                  │  ┌──────────────┐ │
                                  │  │ InCallService │ │  GSM call control
@@ -596,7 +645,12 @@ Reboot to activate.
 - **Calls loop back and never answer**: the Own Number setting is unset, so the
   gateway is INVITEing its own extension.
 - **One-way audio**: Ensure the Magisk module is installed and device is rebooted
-- **Echo**: The app uses Android's AcousticEchoCanceler + VOICE_COMMUNICATION mode
+- **Echo**: On the digital path there is no acoustic echo to cancel — capture
+  reads the modem downlink, not the microphone. If you are hearing echo, the
+  device is running the acoustic fallback, so check which `DeviceProfile` was
+  selected (logged as `Selected profile:` on start-up). Note that playback uses
+  `USAGE_MEDIA`, not `USAGE_VOICE_COMMUNICATION`: the latter does not reach the
+  modem uplink on Qualcomm.
 - **SIP not registering**: Check WiFi connectivity, server address, and credentials
 - **Calls not auto-answering**: Ensure the app is set as the default phone app
 - **Audio drops**: Check WiFi stability; the app holds a WiFi lock but poor signal will cause issues

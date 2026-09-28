@@ -386,11 +386,16 @@ class SipClient(
             uiLog("REGISTER → $serverDomain")
             registrationLatch = CountDownLatch(1)
             sendRegister()
-            // Wait for receiveLoop → handleRegisterResponse to signal
-            try {
-                registrationLatch?.await(REGISTER_TIMEOUT_SEC, TimeUnit.SECONDS)
+            // Wait for receiveLoop → handleRegisterResponse to signal.  The
+            // latch only releases on a definitive answer (200, or an error that
+            // counts down), so a 401 challenge deliberately leaves it armed.
+            // Test the await result, not `registered`: with the server gone the
+            // wait expires, but that field still holds the last success, so the
+            // timeout read as a reply and the app stayed "online".
+            val answered = try {
+                registrationLatch?.await(REGISTER_TIMEOUT_SEC, TimeUnit.SECONDS) ?: false
             } catch (_: InterruptedException) { return false }
-            if (registered) {
+            if (answered && registered) {
                 RegisterBackoff.onSuccess()
                 registerFailures = 0
                 return true

@@ -119,6 +119,11 @@ data class DeviceProfile(
     /** HAL parameter name for incall_music (set via AudioManager.setParameters). */
     val incallMusicParam: String,
 
+    /** Samsung's ABOX HAL takes three extra parameters alongside incall_music.
+     *  Was inferred from profile.name containing "Exynos", so renaming the
+     *  profile would have dropped them silently. */
+    val samsungAboxHalParams: Boolean = false,
+
     /** Whether VOICE_DOWNLINK returns real audio on this device. */
     val voiceDownlinkWorks: Boolean,
 
@@ -367,30 +372,71 @@ data class DeviceProfile(
             return cmd.replace("tinymix", bin)
         }
 
-        /** Auto-detect the device and return the appropriate profile. */
+        /**
+         * Read a system property by running getprop.
+         *
+         *  There is no public Build field for ro.board.platform, and it is the
+         *  only SoC key that is populated on every ROM: ro.soc.model and
+         *  ro.soc.manufacturer only exist from Android 12, and were empty on an
+         *  Android 10 Redmi Note 7 Pro that reports the same sm6150 chip.
+         */
+        private fun sysProp(name: String): String = try {
+            ProcessBuilder("getprop", name).redirectErrorStream(true).start()
+                .inputStream.bufferedReader().use { it.readText() }.trim()
+        } catch (e: Exception) {
+            Log.w(TAG, "getprop $name failed: ${e.message}")
+            ""
+        }
+
+        /**
+         * Auto-detect the device and return the appropriate profile.
+         *
+         * Build.BOARD is a build property the ROM vendor picks, and the same
+         * phone reports different values per ROM: a Redmi Note 7 Pro was seen
+         * as board "sm6150" on one LineageOS build and "violet" (the product
+         * codename) on another, silently demoting it to genericQualcomm().
+         * That lost MultiMedia5, the voice_extn call_state announcement and
+         * the mic mute — and logged nothing, because every mixer command
+         * ends in 2>/dev/null.
+         *
+         * Keys, most reliable first:
+         *   ro.board.platform  - names the chip, present on every ROM
+         *   Build.SOC_MODEL    - ro.soc.model, Android 12+ only
+         *   Build.BOARD        - kept last, for ROMs that set the others oddly
+         */
         fun detect(): DeviceProfile {
             val hw = Build.HARDWARE.lowercase()
             val board = Build.BOARD.lowercase()
             val model = Build.MODEL.lowercase()
-            Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
+            val socModel = Build.SOC_MODEL?.lowercase().orEmpty()
+            val socMaker = Build.SOC_MANUFACTURER?.lowercase().orEmpty()
+            val platform = sysProp("ro.board.platform").lowercase()
+            Log.i(
+                TAG,
+                "Detecting device: hw=$hw platform=$platform socModel=$socModel " +
+                    "socMaker=$socMaker board=$board model=${Build.MODEL} device=${Build.DEVICE}"
+            )
+
+            val chip = "$platform $socModel $board"
 
             return when {
                 // Samsung Galaxy S10e Exynos (Exynos 9820)
-                board.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
+                chip.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
                     exynos9820()
 
                 // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
                 // e.g. Poco X3 NFC.  The WCD9304 control names some older
                 // Qualcomm parts use do not exist here, so they are not set.
-                board.contains("sm6150") || board.contains("sm7150") ->
+                chip.contains("sm6150") || chip.contains("sm7150") ->
                     sm6150()
 
                 // Generic Qualcomm — try incall_music, skip codec-specific controls
-                hw.contains("qcom") || hw.contains("qualcomm") ->
+                hw.contains("qcom") || hw.contains("qualcomm") ||
+                    socMaker.contains("qualcomm") || socMaker == "qti" ->
                     genericQualcomm()
 
                 // Generic Samsung Exynos
-                hw.contains("exynos") || hw.contains("samsung") ->
+                hw.contains("exynos") || hw.contains("samsung") || socMaker.contains("samsung") ->
                     genericExynos()
 
                 // Unknown device — minimal mixer interaction
@@ -517,6 +563,7 @@ data class DeviceProfile(
             // This gives AudioRecord time to lock onto its PCM device before
             // the HAL re-routes for incall_music.
             incallMusicParam = "incall_music_enabled",
+            samsungAboxHalParams = true,
             voiceDownlinkWorks = true,
             voiceCallVolPercent = 0,   // Minimum — vol=12 caused acoustic echo
             // USAGE_MEDIA: Routes through SPUS → SIFS0/SIFS1 (normal playback).
