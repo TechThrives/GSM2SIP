@@ -20,6 +20,7 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
@@ -73,6 +74,41 @@ class CallOrchestrator(
         Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "bridge-timers").apply { isDaemon = true }
         }
+
+    /**
+     * Telecom normally delivers a state callback when the remote GSM party
+     * hangs up.  On some Android/RadioInterface combinations it updates the
+     * Call object first and delivers onCallRemoved later (or skips the state
+     * callback altogether).  Polling the tracked Call is a cheap safety net
+     * which prevents the SIP leg from being left up after the cellular leg is
+     * gone.
+     */
+    @Volatile private var gsmStateWatchdog: ScheduledFuture<*>? = null
+
+    private fun ensureGsmStateWatchdog() {
+        if (gsmStateWatchdog?.isCancelled == false) return
+        val gen = generation
+        gsmStateWatchdog = timers.scheduleAtFixedRate(watchdog@{
+            if (generation != gen || bridgeState == BridgeState.IDLE ||
+                bridgeState == BridgeState.TEARING_DOWN) {
+                gsmStateWatchdog?.cancel(false)
+                gsmStateWatchdog = null
+                return@watchdog
+            }
+
+            val call = activeGsmCall ?: return@watchdog
+            val state = try {
+                call.state
+            } catch (e: Exception) {
+                Log.w(TAG, "Unable to read GSM call state: ${e.message}")
+                return@watchdog
+            }
+            if (state == Call.STATE_DISCONNECTING || state == Call.STATE_DISCONNECTED) {
+                Log.i(TAG, "GSM watchdog detected call end (state=$state)")
+                tearDown("GSM call disconnected")
+            }
+        }, 250, 250, TimeUnit.MILLISECONDS)
+    }
 
     /** Bumped every time the bridge returns to IDLE.
      *
@@ -397,6 +433,7 @@ class CallOrchestrator(
         sipCallRetries = 0
         bridgeState = BridgeState.GSM_RINGING
         activeGsmCall = call
+        ensureGsmStateWatchdog()
         listener?.onStateChanged(bridgeState, "GSM call from $number")
 
         // Don't answer GSM yet — place SIP call to Asterisk first.
@@ -411,6 +448,7 @@ class CallOrchestrator(
     override fun onGsmCallActive(call: Call) {
         Log.i(TAG, "GSM call active")
         activeGsmCall = call
+        ensureGsmStateWatchdog()
 
         when (bridgeState) {
             BridgeState.SIP_CALLING, BridgeState.SIP_RINGING -> {
@@ -493,11 +531,16 @@ class CallOrchestrator(
         // even if the call never reaches ACTIVE (e.g. wrong number, rejected)
         if (activeGsmCall == null && bridgeState != BridgeState.IDLE) {
             activeGsmCall = call
+            ensureGsmStateWatchdog()
         }
 
         if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
             tearDown("GSM call disconnected",
                 sipStatusFor(GsmCallManager.lastDisconnectCause))
+        } else if (state == Call.STATE_DISCONNECTING && bridgeState != BridgeState.IDLE) {
+            // Telecom can remain in DISCONNECTING for a while after the radio
+            // has already released the call.  End the SIP leg immediately.
+            tearDown("GSM call disconnecting")
         }
     }
 
@@ -724,6 +767,8 @@ class CallOrchestrator(
     private fun tearDown(reason: String, sipStatus: Pair<Int, String>? = null) {
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
         bridgeState = BridgeState.TEARING_DOWN
+        gsmStateWatchdog?.cancel(false)
+        gsmStateWatchdog = null
         diallerInitiated = false
         Log.i(TAG, "Tearing down bridge: $reason")
 
@@ -753,7 +798,13 @@ class CallOrchestrator(
             }
             activeSipCall = null
 
-            activeGsmCall?.let { call ->
+            // In the outbound flow Telecom can create the Call object and
+            // publish it to GsmCallManager just before the InCallService
+            // state callback reaches this class.  Prefer our tracked object,
+            // but fall back to the manager's object so a SIP CANCEL during GSM
+            // ringing cannot leave the cellular leg ringing indefinitely.
+            val gsmCallToDisconnect = activeGsmCall ?: GsmCallManager.activeCall
+            gsmCallToDisconnect?.let { call ->
                 try {
                     // Always disconnect — not just when ACTIVE.  If the SIP
                     // call fails before GSM is answered, the ringing GSM call
@@ -875,6 +926,8 @@ class CallOrchestrator(
     @Synchronized
     private fun forceReset(reason: String) {
         Log.w(TAG, "Force-resetting bridge: $reason")
+        gsmStateWatchdog?.cancel(false)
+        gsmStateWatchdog = null
         try {
             activeRtpSession?.stop()
         } catch (_: Exception) {}
