@@ -47,6 +47,7 @@ import kotlin.concurrent.thread
 class GatewayService : Service() {
 
     private var sipClient: SipClient? = null
+    private var batteryChargeGuard: BatteryChargeGuard? = null
     private var orchestrator: CallOrchestrator? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -274,6 +275,7 @@ class GatewayService : Service() {
         createNotificationChannel()
         registerNetworkCallback()
         RootShell.init()
+        batteryChargeGuard = BatteryChargeGuard(this).also { it.start() }
         thread(name = "notif-setup") {
             applyNotificationVisibility()
             silenceDefaultSmsApp()
@@ -443,6 +445,9 @@ class GatewayService : Service() {
      */
     private fun applyConfigChange() {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        // Battery protection is independent of SIP validity, so refresh it
+        // before checking whether the SIP fields are complete.
+        batteryChargeGuard?.refresh()
         // Re-post first, so toggling the status bar setting takes effect now
         // rather than at the next restart -- the channel is chosen when the
         // notification is built.  Done before the validity check below, since
@@ -1340,6 +1345,8 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
+        batteryChargeGuard?.stop()
+        batteryChargeGuard = null
         unregisterNetworkCallback()
         stopGateway()
         super.onDestroy()
