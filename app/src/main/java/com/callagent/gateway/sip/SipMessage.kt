@@ -12,17 +12,22 @@ class SipMessage private constructor(
     val body: String
 ) {
 
-    val isRequest: Boolean get() = !startLine.startsWith("SIP/")
-    val isResponse: Boolean get() = startLine.startsWith("SIP/")
+    // Be liberal about whitespace.  A few SIP stacks prepend a space to the
+    // status line when formatting a response; that is harmless on the wire
+    // but used to make the message look like an unknown request here.
+    private val normalizedStartLine: String get() = startLine.trimStart('\uFEFF', ' ', '\t')
+    val isRequest: Boolean get() = !normalizedStartLine.startsWith("SIP/", ignoreCase = true)
+    val isResponse: Boolean get() = normalizedStartLine.startsWith("SIP/", ignoreCase = true)
 
     val method: String?
-        get() = if (isRequest) startLine.split(" ").firstOrNull() else null
+        get() = if (isRequest) normalizedStartLine.trim().split(Regex("\\s+"), limit = 2).firstOrNull() else null
 
     val statusCode: Int?
-        get() = if (isResponse) startLine.split(" ").getOrNull(1)?.toIntOrNull() else null
+        get() = if (isResponse) STATUS_CODE.matchEntire(normalizedStartLine.trim())
+            ?.groupValues?.get(1)?.toIntOrNull() else null
 
     val requestUri: String?
-        get() = if (isRequest) startLine.split(" ").getOrNull(1) else null
+        get() = if (isRequest) normalizedStartLine.trim().split(Regex("\\s+"), limit = 3).getOrNull(1) else null
 
     fun header(name: String): String? =
         headers[name.lowercase()]
@@ -202,25 +207,32 @@ class SipMessage private constructor(
     private var raw: String? = null
 
     companion object {
+        private val HEADER_SEPARATOR = Regex("\\r?\\n\\r?\\n")
+        private val STATUS_CODE = Regex("^SIP/\\S+\\s+(\\d{3})(?:\\s+.*)?$", RegexOption.IGNORE_CASE)
+
         /** Parse a raw SIP message string */
         fun parse(data: String): SipMessage? {
-            val headerBodySplit = data.indexOf("\r\n\r\n")
-            if (headerBodySplit < 0) return null
+            val separator = HEADER_SEPARATOR.find(data) ?: return null
+            val headerSection = data.substring(0, separator.range.first)
+            val body = data.substring(separator.range.last + 1)
+            val lines = headerSection.split(Regex("\\r?\\n"))
+            if (lines.isEmpty() || lines[0].trim().isEmpty()) return null
 
-            val headerSection = data.substring(0, headerBodySplit)
-            val body = data.substring(headerBodySplit + 4)
-            val lines = headerSection.split("\r\n")
-            if (lines.isEmpty()) return null
-
-            val startLine = lines[0]
+            val startLine = lines[0].trimStart('\uFEFF')
             val headers = LinkedHashMap<String, String>()
+            var previousKey: String? = null
             for (i in 1 until lines.size) {
                 val line = lines[i]
+                if (line.startsWith(" ") || line.startsWith("\t")) {
+                    previousKey?.let { headers[it] = "${headers[it]} ${line.trim()}" }
+                    continue
+                }
                 val colonIdx = line.indexOf(':')
                 if (colonIdx > 0) {
                     val key = line.substring(0, colonIdx).trim().lowercase()
                     val value = line.substring(colonIdx + 1).trim()
                     headers[key] = value
+                    previousKey = key
                 }
             }
 

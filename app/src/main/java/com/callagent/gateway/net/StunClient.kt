@@ -1,5 +1,6 @@
 package com.callagent.gateway.net
 
+import android.net.Network
 import android.util.Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -42,10 +43,13 @@ object StunClient {
      *
      * @param localSocket optional existing socket to reuse (discovers mapping for that socket)
      */
-    fun discover(localSocket: DatagramSocket? = null): StunResult? {
+    fun discover(
+        localSocket: DatagramSocket? = null,
+        network: Network? = null
+    ): StunResult? {
         for ((host, port) in STUN_SERVERS) {
             try {
-                val result = queryServer(host, port, localSocket)
+                val result = queryServer(host, port, localSocket, network)
                 if (result != null) {
                     Log.i(TAG, "STUN result from $host: ${result.publicIp}:${result.publicPort}")
                     return result
@@ -58,10 +62,16 @@ object StunClient {
         return null
     }
 
-    private fun queryServer(host: String, port: Int, reuseSocket: DatagramSocket?): StunResult? {
+    private fun queryServer(
+        host: String,
+        port: Int,
+        reuseSocket: DatagramSocket?,
+        network: Network?
+    ): StunResult? {
         val sock = reuseSocket ?: DatagramSocket()
         val oldTimeout = sock.soTimeout
         try {
+            network?.bindSocket(sock)
             sock.soTimeout = 3000
 
             // Build STUN Binding Request (20 bytes header, no attributes)
@@ -75,7 +85,8 @@ object StunClient {
             request.put(txId)
             val reqBytes = request.array()
 
-            val addr = InetAddress.getByName(host)
+            val addr = network?.getAllByName(host)?.firstOrNull()
+                ?: InetAddress.getByName(host)
             sock.send(DatagramPacket(reqBytes, reqBytes.size, addr, port))
 
             // Receive response

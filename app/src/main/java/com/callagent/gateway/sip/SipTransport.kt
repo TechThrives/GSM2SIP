@@ -1,13 +1,16 @@
 package com.callagent.gateway.sip
 
+import android.net.Network
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructTimeval
 import android.util.Log
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
@@ -56,54 +59,61 @@ interface SipTransport {
 /** The original datagram transport: one packet in, one message out. */
 class UdpSipTransport(
     override val localPort: Int,
+    private val network: Network? = null,
     private val soTimeoutMs: Int = 5000
 ) : SipTransport {
 
     override val viaTransport = "UDP"
 
-    private var socket: DatagramSocket? = null
+    private var fd: java.io.FileDescriptor? = null
     private val buf = ByteArray(4096)
 
-    override val isOpen: Boolean get() = socket?.isClosed == false
+    override val isOpen: Boolean get() = fd?.valid() == true
 
     override fun open() {
-        socket?.close()
-        val s = DatagramSocket(null)
-        s.reuseAddress = true
-        s.bind(InetSocketAddress(localPort))
-        s.soTimeout = soTimeoutMs
-        s.receiveBufferSize = 65535
-        s.sendBufferSize = 65535
-        socket = s
+        close()
+        val f = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_DGRAM, OsConstants.IPPROTO_UDP)
+        try {
+            Os.setsockoptInt(f, OsConstants.SOL_SOCKET, OsConstants.SO_REUSEADDR, 1)
+            Os.setsockoptTimeval(f, OsConstants.SOL_SOCKET, OsConstants.SO_RCVTIMEO,
+                StructTimeval.fromMillis(soTimeoutMs.toLong()))
+            network?.bindSocket(f)
+            Os.bind(f, InetAddress.getByName("0.0.0.0"), localPort)
+            fd = f
+        } catch (e: Exception) {
+            try { Os.close(f) } catch (_: Exception) { }
+            throw e
+        }
     }
 
     override fun send(data: String, host: String, port: Int) {
         val bytes = data.toByteArray(Charsets.UTF_8)
-        val packet = DatagramPacket(bytes, bytes.size, InetAddress.getByName(host), port)
-        socket?.send(packet)
+        fd?.let { Os.sendto(it, bytes, 0, bytes.size, 0, InetAddress.getByName(host), port) }
     }
 
     /** Pre-resolved server address, so sending never blocks on DNS. */
     fun send(data: String, addr: InetAddress, port: Int) {
         val bytes = data.toByteArray(Charsets.UTF_8)
-        socket?.send(DatagramPacket(bytes, bytes.size, addr, port))
+        fd?.let { Os.sendto(it, bytes, 0, bytes.size, 0, addr, port) }
     }
 
     override fun receive(): Pair<String, Pair<String, Int>>? {
-        val s = socket ?: return null
+        val f = fd ?: return null
         return try {
-            val packet = DatagramPacket(buf, buf.size)
-            s.receive(packet)
-            val data = String(packet.data, 0, packet.length, Charsets.UTF_8)
-            data to (packet.address.hostAddress.orEmpty() to packet.port)
-        } catch (_: SocketTimeoutException) {
+            val source = InetSocketAddress(0)
+            val length = Os.recvfrom(f, buf, 0, buf.size, 0, source)
+            val data = String(buf, 0, length, Charsets.UTF_8)
+            data to (source.address.hostAddress.orEmpty() to source.port)
+        } catch (_: android.system.ErrnoException) {
+            null
+        } catch (_: SocketException) {
             null
         }
     }
 
     override fun close() {
-        socket?.close()
-        socket = null
+        fd?.let { try { Os.close(it) } catch (_: Exception) { } }
+        fd = null
     }
 }
 
