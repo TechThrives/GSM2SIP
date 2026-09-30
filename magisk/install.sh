@@ -86,34 +86,61 @@ else
 fi
 
 # ── Hide PermissionController ─────────────────────────
-# PermissionController sets RECORD_AUDIO appop to MODE_FOREGROUND which
-# denies AudioRecord for foreground services on cold boot (no Activity
-# in TOP state).  Hiding the APK via Magisk overlay prevents it from
-# running at all.  On a dedicated gateway device, permission management
-# UI is never used — the module grants all permissions in service.sh.
-PC_HIDDEN=false
-for PC_PATH in \
-    /system/priv-app/PermissionController \
-    /system/product/priv-app/PermissionController \
-    /system/system_ext/priv-app/PermissionController \
-    /system/priv-app/GooglePermissionController \
-    /system/product/priv-app/GooglePermissionController \
-; do
-    if [ -d "$PC_PATH" ]; then
-        # Create overlay directory with .replace to hide the real one
-        PC_OVERLAY="$MODPATH${PC_PATH}"
-        mkdir -p "$PC_OVERLAY"
-        touch "$PC_OVERLAY/.replace"
-        ui_print "- Hiding PermissionController: $PC_PATH"
-        PC_HIDDEN=true
-    fi
-done
-if [ "$PC_HIDDEN" = "false" ]; then
-    # Fallback: create the common AOSP path anyway
-    mkdir -p "$MODPATH/system/priv-app/PermissionController"
-    touch "$MODPATH/system/priv-app/PermissionController/.replace"
-    ui_print "- PermissionController path not found, using default overlay"
-fi
+# It sets RECORD_AUDIO to MODE_FOREGROUND, denying AudioRecord for a
+# foreground service on cold boot.  Hiding the APK stops that, but only
+# while it lives in /system: from Android 15 it is in an APEX, which mounts
+# read-only before overlays, so it cannot be hidden there.  Ask pm where it
+# is, and match on the APK — an empty leftover directory used to fake a
+# successful hide for a package still running from the APEX.
+PC_REAL=$(pm path com.android.permissioncontroller 2>/dev/null | head -1 | sed 's/^package://')
+case "$PC_REAL" in
+    /apex/*)
+        ui_print "! PermissionController is in an APEX ($PC_REAL)"
+        ui_print "  Cannot be hidden: APEXs mount read-only before overlays."
+        ui_print "  Cold-boot audio may need the UI opened once after boot."
+        PC_HIDDEN=false
+        ;;
+    /*)
+        PC_DIR=$(dirname "$PC_REAL")
+        if [ -f "$PC_DIR"/PermissionController.apk ]; then
+            PC_OVERLAY="$MODPATH$PC_DIR"
+            mkdir -p "$PC_OVERLAY"
+            touch "$PC_OVERLAY/.replace"
+            ui_print "- Hiding PermissionController: $PC_DIR"
+            PC_HIDDEN=true
+        else
+            ui_print "! PermissionController at $PC_DIR but no APK found"
+            PC_HIDDEN=false
+        fi
+        ;;
+    *)
+        # pm did not resolve it; walk the known paths instead.
+        PC_HIDDEN=false
+        for PC_PATH in \
+            /system/priv-app/PermissionController \
+            /system/product/priv-app/PermissionController \
+            /system/system_ext/priv-app/PermissionController \
+            /system/priv-app/GooglePermissionController \
+            /system/product/priv-app/GooglePermissionController \
+        ; do
+            for PC_APK in \
+                "$PC_PATH"/PermissionController.apk \
+                "$PC_PATH"/GooglePermissionController.apk \
+            ; do
+                [ -f "$PC_APK" ] || continue
+                PC_OVERLAY="$MODPATH$PC_PATH"
+                mkdir -p "$PC_OVERLAY"
+                touch "$PC_OVERLAY/.replace"
+                ui_print "- Hiding PermissionController: $PC_PATH"
+                PC_HIDDEN=true
+                break
+            done
+            [ "$PC_HIDDEN" = "true" ] && break
+        done
+        [ "$PC_HIDDEN" = "false" ] && \
+            ui_print "- PermissionController not found; nothing to hide"
+        ;;
+esac
 
 # ── Set permissions ───────────────────────────────────
 set_perm_recursive $MODPATH 0 0 0755 0644
@@ -142,7 +169,11 @@ ui_print "- SIP-GSM Gateway installed as priv-app"
 ui_print "- Privileged permissions configured:"
 ui_print "    CAPTURE_AUDIO_OUTPUT, MODIFY_PHONE_STATE,"
 ui_print "    READ_PRIVILEGED_PHONE_STATE, CALL_PRIVILEGED"
-ui_print "- PermissionController hidden (cold boot audio fix)"
+if [ "$PC_HIDDEN" = "true" ]; then
+    ui_print "- PermissionController hidden (cold boot audio fix)"
+else
+    ui_print "- PermissionController NOT hidden; cold boot audio unverified"
+fi
 ui_print "- Runtime permissions will be auto-granted on boot"
 ui_print ""
 ui_print "- Reboot required to activate"

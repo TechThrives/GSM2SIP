@@ -181,35 +181,39 @@ silence_messages && log -t "$TAG" "Silenced notifications: $MSGS"
 ) &
 ) &
 
-# ── PermissionController: hidden by Magisk overlay ────
-# The module's filesystem overlay hides PermissionController's APK
-# (system/priv-app/PermissionController/.replace), so Android cannot
-# start it at all.  Previous approaches all failed:
-#   - killall: auto-restarts in ~3s
-#   - appops set --uid: overridden immediately
-#   - pm disable-user: Android still started it for service binding
-#   - Activity launch: can't get TOP state with screen locked
-#
-# With the APK hidden at the filesystem level, PermissionController
-# never runs, never sets MODE_FOREGROUND, and appops stay as set.
-#
-# Kill any instance that might have started before module mounted.
+# ── PermissionController ───────────────────────────────
+# It sets RECORD_AUDIO to MODE_FOREGROUND, denying AudioRecord on cold boot.
+# install.sh hides the APK when it is in /system; from Android 15 it is in
+# an APEX and cannot be, so the appops below are what keep capture working.
+# Earlier attempts all failed: killall (restarts in ~3s), appops set --uid
+# (overridden at once), pm disable-user (still started for binding), and an
+# Activity launch (no TOP state with the screen locked).
 killall com.google.android.permissioncontroller 2>/dev/null
 killall com.android.permissioncontroller 2>/dev/null
 
-# Verify PermissionController is actually gone
-if pm list packages 2>/dev/null | grep -q permissioncontroller; then
-    log -t "$TAG" "WARNING: PermissionController still visible to pm!"
-    # Fallback: force-disable it
-    pm disable com.android.permissioncontroller 2>/dev/null
-    pm disable com.google.android.permissioncontroller 2>/dev/null
-else
-    log -t "$TAG" "PermissionController: hidden by Magisk overlay"
-fi
+# Verify rather than assume: an APEX copy cannot be hidden.
+PC_PATH=$(pm path com.android.permissioncontroller 2>/dev/null | head -1 | sed 's/^package://')
+case "$PC_PATH" in
+    /apex/*)
+        log -t "$TAG" "PermissionController: in APEX, cannot be hidden; relying on appops"
+        ;;
+    /*)
+        if pm list packages 2>/dev/null | grep -q permissioncontroller; then
+            log -t "$TAG" "WARNING: PermissionController still visible to pm!"
+            pm disable com.android.permissioncontroller 2>/dev/null
+            pm disable com.google.android.permissioncontroller 2>/dev/null
+        else
+            log -t "$TAG" "PermissionController: hidden by Magisk overlay"
+        fi
+        ;;
+    *)
+        log -t "$TAG" "PermissionController: not found"
+        ;;
+esac
 
 # ── Force-allow RECORD_AUDIO via appops ───────────────
-# With PermissionController gone, this setting persists permanently.
-# Set both UID-level and package-level modes for maximum compatibility.
+# Needed when PermissionController cannot be hidden, harmless when it can.
+# Both UID and package level, for compatibility.
 appops set --uid "$PKG" RECORD_AUDIO allow 2>/dev/null
 appops set "$PKG" RECORD_AUDIO allow 2>/dev/null && \
     log -t "$TAG" "appops RECORD_AUDIO: forced allow (--uid + pkg)" || \

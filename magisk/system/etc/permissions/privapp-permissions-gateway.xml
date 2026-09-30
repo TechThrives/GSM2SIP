@@ -14,15 +14,7 @@
         <permission name="android.permission.MODIFY_PHONE_STATE" />
         <permission name="android.permission.CALL_PRIVILEGED" />
 
-        <!-- System: logging, settings -->
-        <permission name="android.permission.READ_LOGS" />
-        <permission name="android.permission.WRITE_SECURE_SETTINGS" />
-        <permission name="android.permission.INTERACT_ACROSS_USERS" />
-
-        <!-- Telecom: call provider registration -->
-        <permission name="android.permission.REGISTER_CALL_PROVIDER" />
-        <permission name="android.permission.REGISTER_SIM_SUBSCRIPTION" />
+        <!-- Telecom: intercepts GSM calls -->
         <permission name="android.permission.BIND_INCALL_SERVICE" />
-        <permission name="android.permission.BIND_TELECOM_CONNECTION_SERVICE" />
     </privapp-permissions>
 </permissions>
