@@ -55,7 +55,29 @@ class SipMessage private constructor(
         return headerValue.substring(sipIdx + 4, atIdx)
     }
 
-    val callerNumber: String? get() = from?.let { extractUser(it) }
+    /** Extract the number from SIP or tel identities used by caller-ID headers. */
+    private fun extractIdentityUser(headerValue: String): String? {
+        extractUser(headerValue)?.let { return it }
+        val telIdx = headerValue.indexOf("tel:", ignoreCase = true)
+        if (telIdx < 0) return null
+        return headerValue.substring(telIdx + 4)
+            .substringBefore('>')
+            .substringBefore(';')
+            .trim()
+            .ifEmpty { null }
+    }
+
+    /**
+     * Prefer the asserted caller identity when Asterisk sends Outbound CID
+     * in P-Asserted-Identity/Remote-Party-ID; otherwise use From.  Different
+     * PJSIP trunk settings place the same CID in different headers.
+     */
+    val callerNumber: String?
+        get() = sequenceOf(
+            header("p-asserted-identity"),
+            header("remote-party-id"),
+            from
+        ).mapNotNull { it?.let(::extractIdentityUser) }.firstOrNull()
     val dialedNumber: String? get() = to?.let { extractUser(it) }
 
     /** Extract display name from From header, e.g. "Display" <sip:...> */

@@ -328,9 +328,44 @@ class SipCall(
         Log.d(TAG, "Sent ACK for call $callId (CSeq: $cseq)")
     }
 
-    /** Send BYE to terminate the call */
+    /**
+     * Terminate the call using the SIP method appropriate to its state.
+     *
+     * Before 200 OK there is no established dialog, so BYE is invalid and
+     * Asterisk ignores it while continuing to ring the Ring Group.  CANCEL
+     * must reuse the exact INVITE Via branch and CSeq instead.
+     */
     fun hangup() {
         if (state == State.TERMINATED) return
+
+        if (state != State.ANSWERED) {
+            val invite = originalInvite
+            val inviteCseq = invite?.cseq
+                ?.split(" ")?.firstOrNull()?.toIntOrNull()
+            if (invite != null && invite.via != null && inviteCseq != null) {
+                val cancel = SipBuilder.cancel(
+                    invite.requestUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}",
+                    invite.via,
+                    invite.from ?: fromHeader,
+                    invite.to ?: toHeader,
+                    callId,
+                    inviteCseq,
+                    sipClient.username,
+                    sipClient.publicIp,
+                    sipClient.localPort
+                )
+                sipClient.sendResponse(cancel, remoteContactAddress ?: sipClient.serverAddress)
+                state = State.TERMINATED
+                Log.i(TAG, "Sent CANCEL for early call $callId (CSeq=$inviteCseq)")
+                listener?.onCallTerminated(this)
+                return
+            }
+            Log.w(TAG, "Cannot build CANCEL for early call $callId; INVITE headers unavailable")
+            state = State.TERMINATED
+            listener?.onCallTerminated(this)
+            return
+        }
+
         val uri = remoteContactUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}"
 
         // For an INVITE received by the gateway, the gateway is the UAS and

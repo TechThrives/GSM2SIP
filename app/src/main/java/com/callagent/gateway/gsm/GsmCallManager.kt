@@ -12,7 +12,9 @@ import android.telecom.Call
 import android.telecom.DisconnectCause
 import android.telecom.CallAudioState
 import android.telecom.InCallService
+import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
+import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
@@ -295,23 +297,123 @@ object GsmCallManager {
     }
 
     @SuppressLint("MissingPermission")
-    fun makeCall(context: Context, destination: String) {
-        Log.i(TAG, "Making GSM call to $destination")
+    fun makeCall(context: Context, destination: String, outboundCid: String? = null): Boolean {
+        Log.i(TAG, "Making GSM call to $destination (outbound CID=${outboundCid ?: "none"})")
         val uri = Uri.fromParts("tel", destination, null)
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        val account = outboundCid?.let { findPhoneAccountForCid(context, telecom, it) }
+        if (outboundCid != null && account == null) {
+            Log.e(TAG, "Outbound CID $outboundCid has no unique SIM match; refusing to dial")
+            return false
+        }
         try {
-            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            telecom.placeCall(uri, Bundle())
-            return
+            val extras = Bundle()
+            if (account != null) {
+                extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
+                Log.i(TAG, "Outbound CID $outboundCid matched SIM phone account")
+            }
+            telecom.placeCall(uri, extras)
+            return true
         } catch (e: Exception) {
             Log.w(TAG, "placeCall failed (${e.message}) — falling back to ACTION_CALL")
         }
+        // An ACTION_CALL intent cannot reliably carry the selected account
+        // from a background service.  Refuse rather than dial on the wrong SIM.
+        if (account != null) return false
         try {
             context.startActivity(
                 Intent(Intent.ACTION_CALL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "ACTION_CALL fallback failed: ${e.message}")
+            return false
         }
+    }
+
+    /**
+     * Resolve an outbound caller ID to the PhoneAccount belonging to that SIM.
+     * The configured own_number_slot_N values are deliberately used instead
+     * of the number reported by the SIM: carriers often leave line1Number
+     * blank or expose it in a different format.
+     */
+    @SuppressLint("MissingPermission")
+    private fun findPhoneAccountForCid(
+        context: Context,
+        telecom: TelecomManager,
+        outboundCid: String
+    ): PhoneAccountHandle? {
+        val prefs = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+        val configuredFallback = prefs.getString("own_number", "")?.trim().orEmpty()
+        val accounts = try {
+            telecom.callCapablePhoneAccounts
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not enumerate phone accounts: ${e.message}")
+            return null
+        }
+
+        val tm = context.getSystemService(TelephonyManager::class.java)
+        val sm = context.getSystemService(SubscriptionManager::class.java)
+        // The legacy own_number value was assigned to the lowest active slot
+        // when the per-SIM fields were introduced.  Do not apply it to every
+        // account on a dual-SIM phone, or an unset slot could steal the match.
+        val lowestActiveSlot = try {
+            sm.activeSubscriptionInfoList
+                ?.map { it.simSlotIndex }
+                ?.filter { it >= 0 }
+                ?.minOrNull()
+        } catch (_: Exception) {
+            null
+        }
+        val matches = mutableListOf<PhoneAccountHandle>()
+        for (account in accounts) {
+            val subId = try {
+                tm.getSubscriptionId(account)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not resolve subscription for phone account: ${e.message}")
+                SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            }
+            if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) continue
+
+            val slot = try {
+                sm.getActiveSubscriptionInfo(subId)?.simSlotIndex ?: -1
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not resolve SIM slot for subscription $subId: ${e.message}")
+                -1
+            }
+            if (slot < 0) continue
+
+            val slotNumber = prefs.getString("own_number_slot_$slot", "")
+                ?.trim()
+                ?.ifEmpty { null }
+            val configured = slotNumber ?: if (accounts.size == 1 || slot == lowestActiveSlot) {
+                configuredFallback
+            } else {
+                ""
+            }
+            if (configured.isNotEmpty() && samePhoneNumber(outboundCid, configured)) {
+                Log.i(TAG, "Outbound CID $outboundCid matched SIM slot $slot (subscription $subId)")
+                matches += account
+            } else {
+                Log.d(TAG, "SIM slot $slot candidate number=${configured.ifEmpty { "unset" }} did not match CID $outboundCid")
+            }
+        }
+        if (matches.size != 1) {
+            Log.w(TAG, "Outbound CID $outboundCid matched ${matches.size} SIM accounts; cannot select a unique SIM")
+            return null
+        }
+        return matches.single()
+    }
+
+    private fun samePhoneNumber(first: String, second: String): Boolean {
+        val a = first.filter(Char::isDigit)
+        val b = second.filter(Char::isDigit)
+        if (a.length < 10 || b.length < 10) return false
+        if (a == b) return true
+        // US national numbers may be configured with or without +1.  Do not
+        // match arbitrary last-seven/last-ten digits across other countries.
+        return (a.length == 11 && a.startsWith('1') && a.drop(1) == b) ||
+            (b.length == 11 && b.startsWith('1') && b.drop(1) == a)
     }
 
     /** Music volume percent — from device profile. */

@@ -240,6 +240,23 @@ data class DeviceProfile(
     /** Delay (ms) after speaker route change before mixer setup. */
     val routeChangeDelayMs: Long,
 
+    /** Delay (ms) before opening AudioRecord/AudioTrack after call activation.
+     *
+     * Some Qualcomm builds destroy and recreate an AudioTrack while the
+     * Telecom speaker route is still settling.  If that happens to the track
+     * used for incall_music, Android may silently recreate it as an ordinary
+     * output even though routedDevice later reports TELEPHONY. */
+    val audioRouteSettleDelayMs: Long = 0,
+
+    /** Delay (ms) after RTP release before reusing the Qualcomm voice output.
+     *
+     * Pixel 4a's deep-buffer incall_music output can remain blocked in
+     * AudioFlinger for several seconds after the Java AudioTrack is released.
+     * A following call must wait for that output to drain or it may inherit a
+     * stale TELEPHONY_TX stream.
+     */
+    val audioStopSettleDelayMs: Long = 0,
+
     /** Delay (ms) for appops propagation on cold boot. */
     val appopsPropagationMs: Long,
 ) {
@@ -389,6 +406,7 @@ data class DeviceProfile(
             val hw = Build.HARDWARE.lowercase()
             val board = Build.BOARD.lowercase()
             val model = Build.MODEL.lowercase()
+            val device = Build.DEVICE.lowercase()
             Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
 
             return when {
@@ -403,7 +421,13 @@ data class DeviceProfile(
                 // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
                 // e.g. Poco X3 NFC.  Same incall_music path as MSM8930 but a
                 // different codec, so the WCD9304 control names do not apply.
-                board.contains("sm6150") || board.contains("sm7150") ->
+                // Pixel 4a (sunfish) reports the platform as sm6150 through
+                // ro.board.platform, but Build.BOARD/Build.HARDWARE are both
+                // "sunfish".  Match its codename (not the model name, which
+                // could also match the differently-routed Pixel 4a 5G) so it
+                // does not fall through to Generic and leave the mic live.
+                board.contains("sm6150") || board.contains("sm7150") ||
+                    device == "sunfish" || board == "sunfish" || hw == "sunfish" ->
                     sm6150()
 
                 // Generic Qualcomm — try incall_music, skip WCD9304-specific controls
@@ -932,14 +956,17 @@ data class DeviceProfile(
             incallMusicBeforeTrack = true,
             // The incall_music_uplink mixPort accepts stereo only.
             playbackStereo = true,
-            playbackLowLatency = true,
-            // No override: routing is decided by setPreferredDevice(TELEPHONY)
-            // rather than by buffer size now, so the deep-buffer trick that
-            // forced the track off MultiMedia5 is no longer load-bearing, and
-            // 100ms of playback buffer is 100ms of latency on a live call.
-            // AudioTrack's own minimum for 16 kHz stereo is already ~80ms.
-            playbackBufferMs = 0,
+            // The low-latency output is unstable on this firmware when
+            // Telecom changes the voice route: AudioTrack reports a dead
+            // IAudioTrack and its native write can block for several seconds.
+            // A deep-buffer track is still explicitly routed to TELEPHONY,
+            // but survives the route transition and releases cleanly between
+            // consecutive calls.
+            playbackLowLatency = false,
+            playbackBufferMs = 100,
             routeChangeDelayMs = 500,
+            audioRouteSettleDelayMs = 500,
+            audioStopSettleDelayMs = 18_000,
             appopsPropagationMs = 300,
         )
 

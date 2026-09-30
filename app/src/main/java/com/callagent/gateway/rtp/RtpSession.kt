@@ -49,6 +49,9 @@ class RtpSession(
     private val payloadType: Int = RtpPacket.PT_PCMA
 ) {
     private val running = AtomicBoolean(false)
+    /** Ensures the stop callback is delivered once, including a session that
+     * failed during startup and never reached the running state. */
+    private val stopNotified = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
      *  AudioRecord/AudioTrack before those get released. */
     @Volatile private var workers: List<Thread> = emptyList()
@@ -201,6 +204,7 @@ class RtpSession(
 
     fun start() {
         if (running.getAndSet(true)) return
+        stopNotified.set(false)
         Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
 
         try {
@@ -281,6 +285,24 @@ class RtpSession(
         // it after AudioRecord exists is too late — VOICE_CALL is already bound
         // to a plain capture path and returns silence.
         setHalCallState(2)
+
+        // Telecom may still be completing the earpiece -> speaker transition
+        // when the GSM call first becomes ACTIVE.  On the Pixel 4a, opening an
+        // AudioTrack during that window can produce a dead IAudioTrack which
+        // AudioFlinger recreates as a normal output instead of the
+        // incall_music_uplink output.  The framework can then report
+        // routedDevice=TELEPHONY even though the modem injection usecase was
+        // never opened.  Let the route settle before creating either stream.
+        val settleDelay = profile.audioRouteSettleDelayMs
+        if (settleDelay > 0) {
+            Log.i(TAG, "Waiting ${settleDelay}ms for audio route to settle")
+            try {
+                Thread.sleep(settleDelay)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
 
         // Playback rate matches codec output rate.  G.722 decodes to 16 kHz.
         playbackRate = when (payloadType) {
@@ -420,6 +442,18 @@ class RtpSession(
             audioRecord = record
             audioSessionId = record.audioSessionId
             captureRate = usedRate
+
+            // Prime the Qualcomm in-call capture path before creating the
+            // playback track.  On Pixel 4a the order matters: creating the
+            // incall_music track first can leave the modem TX output waiting
+            // on a voice path that has not been opened yet, producing random
+            // SIP->GSM one-way calls after the first call.
+            try {
+                record.startRecording()
+                Log.i(TAG, "AudioRecord primed before AudioTrack: state=${record.recordingState}")
+            } catch (e: Exception) {
+                Log.w(TAG, "AudioRecord prime failed: ${e.message}")
+            }
 
             // Diagnostic sweep — off unless explicitly enabled, see
             // audioDiagnosticsEnabled().
@@ -759,7 +793,18 @@ class RtpSession(
      * blocking there for up to four joins is how ANRs happen.
      */
     fun stop() {
-        if (!running.getAndSet(false)) return
+        val wasRunning = running.getAndSet(false)
+
+        // Do this before waiting for AudioFlinger/AudioRecord threads.  On the
+        // Pixel 4a an AudioTrack write can remain blocked while the old
+        // incall_music_uplink output is still alive; waiting first lets the
+        // next call open a second output on top of that stale one.
+        stopHalAudioImmediately()
+
+        if (!wasRunning) {
+            notifyRtpStopped()
+            return
+        }
         Log.i(TAG, "Stopping RTP session on port $localPort")
 
         setMonitorEnabled(false)
@@ -793,10 +838,34 @@ class RtpSession(
                 try { it.stop() } catch (_: Exception) {}
                 try { it.release() } catch (_: Exception) {}
             }
-            setHalCallState(1)
+            // Repeat the inactive state after the native streams are released
+            // in case AudioFlinger recreated the output while they drained.
+            stopHalAudioImmediately()
             Log.i(TAG, "RTP session on port $localPort fully released")
-            listener?.onRtpStopped()
+            notifyRtpStopped()
         }, "RTP-Stop-$localPort").start()
+    }
+
+    /** Shut down the Qualcomm voice/in-call output without waiting for worker
+     * threads that may be blocked inside AudioFlinger. */
+    private fun stopHalAudioImmediately() {
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val param = profile.incallMusicParam
+            if (am != null && param.isNotEmpty()) {
+                am.setParameters("${param}=false")
+                Log.i(TAG, "${param}=false (immediate RTP stop)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Immediate incall_music shutdown failed: ${e.message}")
+        }
+        setHalCallState(1)
+    }
+
+    private fun notifyRtpStopped() {
+        if (stopNotified.compareAndSet(false, true)) {
+            listener?.onRtpStopped()
+        }
     }
 
     // ── Capture: VOICE_CALL → echo gate → gain → encode → RTP send ──
@@ -869,7 +938,9 @@ class RtpSession(
     private fun captureLoop(): Boolean {
         val record = audioRecord ?: return false
 
-        record.startRecording()
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            record.startRecording()
+        }
 
         // Re-assert in-call capture routing now that the stream exists — see
         // DeviceProfile.mixerCaptureCmd.  Off the capture thread, because the
@@ -1284,6 +1355,41 @@ class RtpSession(
     private var monitorBuf: ByteArray = ByteArray(0)
 
     /**
+     * Write one playback frame without allowing a wedged Qualcomm incall
+     * output to block the RTP thread for seconds.  Blocking AudioTrack.write()
+     * was observed to stall for 6-10 seconds when the voice route changed;
+     * that left the old incall_music_uplink alive and made the next call
+     * intermittently one-way.
+     */
+    private fun writePlaybackFrame(track: AudioTrack, data: ByteArray) {
+        var offset = 0
+        val deadline = System.nanoTime() + 30_000_000L
+        while (offset < data.size && running.get()) {
+            val written = track.write(
+                data, offset, data.size - offset, AudioTrack.WRITE_NON_BLOCKING
+            )
+            if (written > 0) {
+                offset += written
+                continue
+            }
+            if (written < 0) {
+                Log.w(TAG, "AudioTrack nonblocking write failed: $written")
+                return
+            }
+            if (System.nanoTime() >= deadline) {
+                Log.w(TAG, "AudioTrack nonblocking write timed out (${data.size - offset} bytes left)")
+                return
+            }
+            try {
+                Thread.sleep(1)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
+    }
+
+    /**
      * Duplicate each 16-bit mono sample into both channels.
      *
      * Needed only so the track can match the HAL's stereo-only
@@ -1472,7 +1578,7 @@ class RtpSession(
                 val encoded = jitterBuffer.poll(JITTER_POLL_MS, TimeUnit.MILLISECONDS)
                 if (encoded == null) {
                     // Write silence to keep AudioTrack fed and prevent underruns.
-                    track.write(silenceFrame, 0, silenceFrame.size)
+                    writePlaybackFrame(track, silenceFrame)
                     underruns++
                     playbackRms = 0
                     currentPlaybackActive = false
@@ -1538,7 +1644,7 @@ class RtpSession(
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
                 feedMonitor(pcm)
                 val out = if (playbackChannels == 2) monoToStereo(pcm) else pcm
-                track.write(out, 0, out.size)
+                writePlaybackFrame(track, out)
                 playbackFrames++
             } catch (e: InterruptedException) {
                 break

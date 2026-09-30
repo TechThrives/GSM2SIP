@@ -548,6 +548,10 @@ class SipClient(
             callerIdName = callerIdName,
             srtp = call.localSrtpKeys
         )
+        // Keep the exact INVITE transaction headers.  If the GSM caller
+        // hangs up before Asterisk answers, the early dialog must be ended
+        // with CANCEL using the same Via branch and INVITE CSeq.
+        call.originalInvite = SipMessage.parse(invite)
 
         activeCalls[callId] = call
         sendTo(invite, serverAddress)
@@ -695,6 +699,10 @@ class SipClient(
             auth = auth,
             srtp = call.localSrtpKeys
         )
+        // The authenticated INVITE has a new CSeq and Via branch; a later
+        // early-dialog cancellation must cancel this transaction, not the
+        // initial unauthenticated challenge request.
+        call.originalInvite = SipMessage.parse(invite)
         sendTo(invite, serverAddress)
     }
 
