@@ -46,6 +46,9 @@ class RtpSession(
     private val payloadType: Int = RtpPacket.PT_PCMA
 ) {
     private val running = AtomicBoolean(false)
+    /** Ensures the stop callback is delivered once, including for a session
+     *  that failed during startup and never reached the running state. */
+    private val stopNotified = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
      *  AudioRecord/AudioTrack before those get released. */
     @Volatile private var workers: List<Thread> = emptyList()
@@ -195,6 +198,7 @@ class RtpSession(
 
     fun start() {
         if (running.getAndSet(true)) return
+        stopNotified.set(false)
         Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
 
         try {
@@ -694,7 +698,14 @@ class RtpSession(
      * blocking there for up to four joins is how ANRs happen.
      */
     fun stop() {
-        if (!running.getAndSet(false)) return
+        // Notify exactly once, even for a session that failed during startup
+        // and so never became running.  A caller waiting on the stopped
+        // callback would otherwise wait out its own timeout.
+        val wasRunning = running.getAndSet(false)
+        if (!wasRunning) {
+            notifyRtpStopped()
+            return
+        }
         Log.i(TAG, "Stopping RTP session on port $localPort")
 
         setMonitorEnabled(false)
@@ -734,8 +745,14 @@ class RtpSession(
             }
             setHalCallState(1)
             Log.i(TAG, "RTP session on port $localPort fully released")
-            listener?.onRtpStopped()
+            notifyRtpStopped()
         }, "RTP-Stop-$localPort").start()
+    }
+
+    private fun notifyRtpStopped() {
+        if (stopNotified.compareAndSet(false, true)) {
+            listener?.onRtpStopped()
+        }
     }
 
     // ── Capture: VOICE_CALL → echo gate → gain → encode → RTP send ──

@@ -431,6 +431,15 @@ class CallOrchestrator(
     override fun onIncomingGsmCall(call: Call, number: String) {
         Log.i(TAG, "Incoming GSM call from $number")
 
+        // onCallAdded() and the first STATE_RINGING callback can describe the
+        // same Telecom call.  Rejecting it as a duplicate would cut off a call
+        // we were in the middle of bridging.
+        if (activeGsmCall === call && bridgeState != BridgeState.IDLE &&
+            bridgeState != BridgeState.TEARING_DOWN) {
+            Log.d(TAG, "Ignoring duplicate ringing callback for the same GSM call (state=$bridgeState)")
+            return
+        }
+
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting GSM call")
             GsmCallManager.rejectCall(call)
@@ -440,6 +449,7 @@ class CallOrchestrator(
         resetSipRetries("incoming GSM call")
         bridgeState = BridgeState.GSM_RINGING
         activeGsmCall = call
+        lastStateChangeTime = System.currentTimeMillis()
         listener?.onStateChanged(bridgeState, "GSM call from $number")
 
         // Don't answer GSM yet — place SIP call to Asterisk first.
@@ -533,6 +543,11 @@ class CallOrchestrator(
         if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
             tearDown("GSM call disconnected",
                 sipStatusFor(GsmCallManager.lastDisconnectCause))
+        } else if (state == Call.STATE_DISCONNECTING && bridgeState != BridgeState.IDLE) {
+            // Telecom can sit in DISCONNECTING for a while after the radio has
+            // already released the call.  End the SIP leg now instead of
+            // leaving the caller listening to a dead channel.
+            tearDown("GSM call disconnecting")
         }
     }
 

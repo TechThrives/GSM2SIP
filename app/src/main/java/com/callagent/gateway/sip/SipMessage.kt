@@ -32,6 +32,10 @@ class SipMessage private constructor(
     val contact: String? get() = header("contact")
     val contentType: String? get() = header("content-type")
 
+    /** Request-URI from a request start line, e.g. INVITE sip:x@y SIP/2.0. */
+    val requestUri: String?
+        get() = if (isRequest) startLine.split(" ").getOrNull(1) else null
+
     val fromTag: String?
         get() = from?.let { extractTag(it) }
 

@@ -553,6 +553,11 @@ class SipClient(
             extraHeaders = extraHeaders
         )
 
+        // Keep the INVITE verbatim.  If the GSM caller hangs up before Asterisk
+        // answers, the early dialog can only be ended with a CANCEL, and a
+        // CANCEL is only valid with the original Via branch and CSeq.
+        call.originalInvite = SipMessage.parse(invite)
+
         activeCalls[callId] = call
         sendTo(invite, serverAddress)
         // Log both halves the server routes on: the Request-URI it turns into
@@ -698,6 +703,10 @@ class SipClient(
             srtp = call.localSrtpKeys,
             extraHeaders = call.extraHeaders
         )
+        // This authenticated INVITE has a new CSeq and Via branch, so a later
+        // CANCEL has to cancel this transaction, not the challenge request we
+        // stored earlier.
+        call.originalInvite = SipMessage.parse(invite)
         sendTo(invite, serverAddress)
     }
 
