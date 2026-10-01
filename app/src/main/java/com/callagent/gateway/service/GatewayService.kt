@@ -47,6 +47,7 @@ import kotlin.concurrent.thread
 class GatewayService : Service() {
 
     private var sipClient: SipClient? = null
+    private var batteryChargeGuard: BatteryChargeGuard? = null
     private var orchestrator: CallOrchestrator? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -274,6 +275,7 @@ class GatewayService : Service() {
         createNotificationChannel()
         registerNetworkCallback()
         RootShell.init()
+        batteryChargeGuard = BatteryChargeGuard(this).also { it.start() }
         thread(name = "notif-setup") {
             applyNotificationVisibility()
             silenceDefaultSmsApp()
@@ -443,6 +445,9 @@ class GatewayService : Service() {
      */
     private fun applyConfigChange() {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        // Battery protection is independent of SIP validity, so refresh it
+        // before checking whether the SIP fields are complete.
+        batteryChargeGuard?.refresh()
         // Re-post first, so toggling the status bar setting takes effect now
         // rather than at the next restart -- the channel is chosen when the
         // notification is built.  Done before the validity check below, since
@@ -1136,6 +1141,8 @@ class GatewayService : Service() {
         checkDefaultDialer()
         checkSmsPermission()
 
+        val activeNetwork = (getSystemService(Context.CONNECTIVITY_SERVICE)
+            as ConnectivityManager).activeNetwork
         val localIp = getLocalIp()
         currentLocalIp = localIp
         broadcastLog("Local IP: $localIp")
@@ -1147,7 +1154,7 @@ class GatewayService : Service() {
         val useStun = getSharedPreferences("gateway", MODE_PRIVATE)
             .getBoolean("use_stun", true)
         val stunResult = if (!useStun) null else try {
-            StunClient.discover()
+            StunClient.discover(network = activeNetwork)
         } catch (e: Exception) {
             Log.e(TAG, "STUN exception: ${e.javaClass.simpleName}: ${e.message}")
             null
@@ -1181,7 +1188,10 @@ class GatewayService : Service() {
             serverDomain = cfgServer,
             serverPort = cfgPort,
             localIp = localIp,
-            localPort = 5060,
+            // Pixel/Android Wi-Fi drops unsolicited UDP replies addressed to
+            // a user-space socket on 5060; 5062 works on both Wi-Fi and LTE.
+            localPort = 5062,
+            network = activeNetwork,
             publicIp = publicIp,
             useTls = useTls,
             srtpRequested = prefs.getBoolean("srtp_enabled", false)
@@ -1335,6 +1345,8 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
+        batteryChargeGuard?.stop()
+        batteryChargeGuard = null
         unregisterNetworkCallback()
         stopGateway()
         super.onDestroy()

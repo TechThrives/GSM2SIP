@@ -1,5 +1,6 @@
 package com.callagent.gateway.sip
 
+import android.net.Network
 import android.os.Build
 import com.callagent.gateway.rtp.SrtpCryptoSuite
 import com.callagent.gateway.rtp.SrtpKeys
@@ -26,6 +27,8 @@ class SipClient(
     val serverPort: Int = 5060,
     var localIp: String = "0.0.0.0",
     val localPort: Int = 5060,
+    /** Android network carrying this SIP session; refreshed on reconnect. */
+    private val network: Network? = null,
     /** Public IP discovered via STUN — used in Contact headers and SDP for NAT traversal */
     var publicIp: String = localIp,
     /** SIP over TLS instead of UDP.  Signalling only — RTP is unaffected. */
@@ -164,7 +167,7 @@ class SipClient(
         val t: SipTransport = if (useTls) {
             TlsSipTransport(serverDomain, serverPort, SOCKET_TIMEOUT_MS) { uiLog(it) }
         } else {
-            UdpSipTransport(localPort, SOCKET_TIMEOUT_MS)
+            UdpSipTransport(localPort, network)
         }
         t.open()
         transport = t
@@ -259,7 +262,7 @@ class SipClient(
         }
 
         // Registration responses
-        if (msg.isResponse && msg.cseq?.contains("REGISTER") == true) {
+        if (msg.isResponse && msg.cseq?.contains("REGISTER", ignoreCase = true) == true) {
             handleRegisterResponse(msg)
             return
         }
@@ -545,6 +548,10 @@ class SipClient(
             callerIdName = callerIdName,
             srtp = call.localSrtpKeys
         )
+        // Keep the exact INVITE transaction headers.  If the GSM caller
+        // hangs up before Asterisk answers, the early dialog must be ended
+        // with CANCEL using the same Via branch and INVITE CSeq.
+        call.originalInvite = SipMessage.parse(invite)
 
         activeCalls[callId] = call
         sendTo(invite, serverAddress)
@@ -692,6 +699,10 @@ class SipClient(
             auth = auth,
             srtp = call.localSrtpKeys
         )
+        // The authenticated INVITE has a new CSeq and Via branch; a later
+        // early-dialog cancellation must cancel this transaction, not the
+        // initial unauthenticated challenge request.
+        call.originalInvite = SipMessage.parse(invite)
         sendTo(invite, serverAddress)
     }
 

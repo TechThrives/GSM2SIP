@@ -207,6 +207,23 @@ class SipCall(
                 return true
             }
 
+            // CANCEL is how Asterisk ends an INVITE that is still ringing.
+            // It is different from BYE: acknowledge the CANCEL transaction,
+            // then reject the original INVITE with 487 so the UAC can finish
+            // its call state machine.  Without this branch the GSM leg kept
+            // ringing because the gateway ignored the caller's cancellation.
+            msg.isRequest && msg.method == "CANCEL" -> {
+                Log.i(TAG, "Received CANCEL for call $callId")
+                sipClient.sendResponse(
+                    SipBuilder.ok200(msg, sipClient.username, sipClient.publicIp, sipClient.localPort),
+                    remoteContactAddress ?: sipClient.serverAddress
+                )
+                if (state != State.ANSWERED && state != State.TERMINATED) {
+                    reject(487, "Request Terminated", localTag)
+                }
+                return true
+            }
+
             // 183 Session Progress (early media)
             msg.isResponse && msg.statusCode == 183 -> {
                 state = State.RINGING
@@ -264,6 +281,15 @@ class SipCall(
         val invite = originalInvite ?: return
         val toTag = localTag
 
+        // The INVITE's To header has no local tag.  The tag we put into the
+        // 200 OK becomes part of the dialog identifier and must also be used
+        // on a later BYE.  Keeping the untagged INVITE header here makes
+        // Asterisk answer the BYE with 481, leaving the SIP caller up until
+        // its own timeout even though the GSM leg already ended.
+        toHeader = invite.to?.let { to ->
+            if (to.contains(";tag=")) to else "$to;tag=$toTag"
+        }
+
         val ok = SipBuilder.ok200(
             invite, sipClient.username, sipClient.publicIp, sipClient.localPort,
             localRtpPort = localRtpPort, toTag = toTag,
@@ -278,11 +304,11 @@ class SipCall(
     }
 
     /** Turn down an inbound INVITE we cannot bridge. */
-    fun reject(code: Int, reason: String) {
+    fun reject(code: Int, reason: String, toTag: String = localTag) {
         if (state == State.TERMINATED) return
         val invite = originalInvite ?: return
 
-        val response = SipBuilder.reject(invite, code, reason, localTag)
+        val response = SipBuilder.reject(invite, code, reason, toTag)
         sipClient.sendResponse(response, invite.contactAddress ?: sipClient.serverAddress)
 
         state = State.TERMINATED
@@ -302,13 +328,56 @@ class SipCall(
         Log.d(TAG, "Sent ACK for call $callId (CSeq: $cseq)")
     }
 
-    /** Send BYE to terminate the call */
+    /**
+     * Terminate the call using the SIP method appropriate to its state.
+     *
+     * Before 200 OK there is no established dialog, so BYE is invalid and
+     * Asterisk ignores it while continuing to ring the Ring Group.  CANCEL
+     * must reuse the exact INVITE Via branch and CSeq instead.
+     */
     fun hangup() {
         if (state == State.TERMINATED) return
+
+        if (state != State.ANSWERED) {
+            val invite = originalInvite
+            val inviteCseq = invite?.cseq
+                ?.split(" ")?.firstOrNull()?.toIntOrNull()
+            if (invite != null && invite.via != null && inviteCseq != null) {
+                val cancel = SipBuilder.cancel(
+                    invite.requestUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}",
+                    invite.via,
+                    invite.from ?: fromHeader,
+                    invite.to ?: toHeader,
+                    callId,
+                    inviteCseq,
+                    sipClient.username,
+                    sipClient.publicIp,
+                    sipClient.localPort
+                )
+                sipClient.sendResponse(cancel, remoteContactAddress ?: sipClient.serverAddress)
+                state = State.TERMINATED
+                Log.i(TAG, "Sent CANCEL for early call $callId (CSeq=$inviteCseq)")
+                listener?.onCallTerminated(this)
+                return
+            }
+            Log.w(TAG, "Cannot build CANCEL for early call $callId; INVITE headers unavailable")
+            state = State.TERMINATED
+            listener?.onCallTerminated(this)
+            return
+        }
+
         val uri = remoteContactUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}"
 
+        // For an INVITE received by the gateway, the gateway is the UAS and
+        // must send the in-dialog BYE with the original To header as From and
+        // the original From header as To.  Outbound calls use the headers in
+        // their stored order.  Using one order for both directions produces
+        // a syntactically valid BYE that Asterisk rejects with 481.
+        val byeFrom = if (direction == Direction.INBOUND) toHeader else fromHeader
+        val byeTo = if (direction == Direction.INBOUND) fromHeader else toHeader
+
         val bye = SipBuilder.bye(
-            uri, fromHeader, toHeader,
+            uri, byeFrom, byeTo,
             callId, localCseq++,
             sipClient.username, sipClient.publicIp, sipClient.localPort
         )

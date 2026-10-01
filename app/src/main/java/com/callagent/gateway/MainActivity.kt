@@ -560,6 +560,15 @@ class MainActivity : AppCompatActivity() {
             prefs.getBoolean("use_stun", true)
         findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked =
             prefs.getBoolean("translit_ascii", false)
+        findViewById<CheckBox>(R.id.cbCfgBatteryProtection).isChecked =
+            prefs.getBoolean("battery_protection", false)
+        findViewById<EditText>(R.id.etCfgBatteryStart).setText(
+            prefs.getInt("battery_start_threshold", 35).toString()
+        )
+        findViewById<EditText>(R.id.etCfgBatteryStop).setText(
+            prefs.getInt("battery_stop_threshold", 65).toString()
+        )
+        refreshBatteryProtectionStatus()
         val cbTls = findViewById<CheckBox>(R.id.cbCfgTls)
         val cbSrtp = findViewById<CheckBox>(R.id.cbCfgSrtp)
         cbTls.isChecked = prefs.getBoolean("sip_tls", false)
@@ -666,6 +675,11 @@ class MainActivity : AppCompatActivity() {
         val auto = findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked
         val useStun = findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked
         val translit = findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked
+        val batteryProtection = findViewById<CheckBox>(R.id.cbCfgBatteryProtection).isChecked
+        val batteryStart = findViewById<EditText>(R.id.etCfgBatteryStart)
+            .text.toString().trim().toIntOrNull() ?: 35
+        val batteryStop = findViewById<EditText>(R.id.etCfgBatteryStop)
+            .text.toString().trim().toIntOrNull() ?: 65
         val tls = findViewById<CheckBox>(R.id.cbCfgTls).isChecked
         // Stored as asked for, but only ever acted on with TLS — so turning
         // TLS off and on again does not silently lose the audio setting.
@@ -679,6 +693,16 @@ class MainActivity : AppCompatActivity() {
 
         if (server.isEmpty() || user.isEmpty()) {
             Toast.makeText(this, "Server and username are required", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (batteryProtection &&
+            (batteryStart !in 5..90 || batteryStop !in 10..100 || batteryStart + 5 >= batteryStop)
+        ) {
+            Toast.makeText(
+                this,
+                "Battery limits must be 5–90%, 10–100%, with at least 5% between them",
+                Toast.LENGTH_LONG
+            ).show()
             return
         }
         getSharedPreferences("gateway", MODE_PRIVATE).edit()
@@ -695,6 +719,9 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("autoconnect", auto)
             .putBoolean("use_stun", useStun)
             .putBoolean("translit_ascii", translit)
+            .putBoolean("battery_protection", batteryProtection)
+            .putInt("battery_start_threshold", batteryStart)
+            .putInt("battery_stop_threshold", batteryStop)
             .putBoolean("sip_tls", tls)
             .putBoolean("srtp_enabled", srtp)
             .putString("codec", codec)
@@ -706,6 +733,7 @@ class MainActivity : AppCompatActivity() {
                 "tls=${if (tls) "on" else "off"}, " +
                 "srtp=${if (srtp && tls) "on" else "off"}, " +
                 "ascii=${if (translit) "on" else "off"}, " +
+                    "battery=${if (batteryProtection) "$batteryStart-$batteryStop%" else "off"}, " +
                     "agent volume ${if (agentVolStep > 0) "+$agentVolStep" else "$agentVolStep"})"
         )
         Toast.makeText(this, "Saved — reconnecting", Toast.LENGTH_SHORT).show()
@@ -716,6 +744,39 @@ class MainActivity : AppCompatActivity() {
             action = GatewayService.ACTION_APPLY_CONFIG
         })
         switchTab("home")
+    }
+
+    /** Read the root-controlled charger state without blocking the UI thread. */
+    private fun refreshBatteryProtectionStatus() {
+        val status = findViewById<TextView>(R.id.tvCfgBatteryStatus)
+        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        if (!prefs.getBoolean("battery_protection", false)) {
+            status.text = "Disabled"
+            return
+        }
+        status.text = "Checking charger status…"
+        Thread({
+            val out = RootShell.execForOutput(
+                "echo CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null); " +
+                    "echo DIS=$(cat /sys/class/power_supply/smb5/charge_disable 2>/dev/null); " +
+                    "echo USB=$(cat /sys/class/power_supply/usb/online 2>/dev/null)",
+                timeoutMs = 5000
+            )
+            val values = out.lines().mapNotNull {
+                val i = it.indexOf('=')
+                if (i > 0) it.substring(0, i) to it.substring(i + 1).trim() else null
+            }.toMap()
+            val cap = values["CAP"]?.toIntOrNull()
+            val disabled = values["DIS"] == "1"
+            val online = values["USB"] == "1"
+            val text = when {
+                cap == null -> "Root charger control is unavailable"
+                !online -> "Protection enabled · USB not connected · ${cap}%"
+                disabled -> "Protection enabled · charging stopped at ${cap}%"
+                else -> "Protection enabled · charging allowed at ${cap}%"
+            }
+            runOnUiThread { if (!isFinishing) status.text = text }
+        }, "battery-status").start()
     }
 
     /** Cut the agent's audio to the caller.  The call stays up; this only
