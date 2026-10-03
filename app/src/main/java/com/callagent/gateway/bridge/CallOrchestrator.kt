@@ -168,10 +168,9 @@ class CallOrchestrator(
      * [subId] identifies the SIM that actually took the call.  On a dual-SIM
      * gateway the default subscription is the wrong question to ask: a call
      * arriving on the non-default SIM would be announced as the default SIM's
-     * DID and routed to the wrong assistant.  Passing the subscription in
-     * mirrors what [com.callagent.gateway.service.GatewayService] already does
-     * for SMS via ownNumberForSub().  When the caller cannot say which SIM it
-     * was, the default subscription is the fallback, as before.
+     * DID and routed to the wrong assistant.  Resolved through the same
+     * [OwnNumber.numberForSubscriptionId] the SMS path uses, so a message and a
+     * call from one SIM can never name two different DIDs.
      *
      * Asks the platform first; many carriers do not publish the number on the
      * SIM, in which case the configured value is used.
@@ -403,10 +402,14 @@ class CallOrchestrator(
         Log.i(TAG, "SIP call terminated: ${call.callId} (bridge=$bridgeState, retries=$sipCallRetries)")
         if (call != activeSipCall) return
 
-        // If GSM is still ringing and we haven't exhausted retries, try again.
-        // Transient network issues or socket races can kill the first SIP attempt.
+        // If GSM is still ringing and we haven't exhausted retries, try again —
+        // but only after a transient failure.  A deliberate answer from the far
+        // side (busy, declined, unavailable) must end the GSM call: retrying it
+        // re-rang the softphone after the user had rejected the call.
+        val status = call.finalStatus
+        val transient = status == 0 || status == 408 || status == 500 || status == 503 || status == 504
         if ((bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)
-            && sipCallRetries < MAX_SIP_RETRIES && activeGsmCall != null) {
+            && transient && sipCallRetries < MAX_SIP_RETRIES && activeGsmCall != null) {
             sipCallRetries++
             Log.w(TAG, "SIP call failed while GSM ringing — retrying ($sipCallRetries/$MAX_SIP_RETRIES)")
             listener?.onStateChanged(bridgeState, "SIP retry $sipCallRetries/$MAX_SIP_RETRIES")
@@ -422,6 +425,7 @@ class CallOrchestrator(
             return
         }
 
+        if (status >= 300) Log.i(TAG, "SIP side answered $status — not retrying, ending the GSM call")
         tearDown("SIP call ended")
     }
 

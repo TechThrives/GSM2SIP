@@ -548,7 +548,7 @@ class GatewayService : Service() {
                 val sip = sipClient
                 if (sip == null || !sip.registered) {
                     broadcastLog("SMS: ${queue.size} queued, waiting for registration")
-                    scheduleSmsRetry()
+                    scheduleSmsRetry(queue.first().attempts)
                     return@thread
                 }
                 broadcastLog("SMS: forwarding ${queue.size} message(s) [$reason]")
@@ -558,17 +558,28 @@ class GatewayService : Service() {
                 // receiver: the default app writes its row when it handles
                 // SMS_DELIVER, which may not have happened yet at that point.
                 markInboxRead()
-                var failed = false
+                // The failing message's own count, not queue.first(): the snapshot's head may
+                // have been accepted or given up on by the time we get here.
+                var failedAttempts = -1
                 for (sms in queue) {
                     val code = sendSmsOverSip(sip, sms)
                     if (code == 200 || code == 202) {
                         SmsInbox.remove(this, sms.id)
                         CallLogStore.updateSms(this, sms.id) { it.copy(status = "forwarded") }
                         broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
-                    } else if (code == 400) {
+                    } else if (isPermanentSmsRejection(code)) {
                         SmsInbox.remove(this, sms.id)
                         CallLogStore.updateSms(this, sms.id) { it.copy(status = "discarded") }
-                        broadcastLog("SMS: ${sms.id} discarded as permanently invalid")
+                        broadcastLog("SMS: ${sms.id} discarded as permanently invalid ($code)")
+                    } else if (sms.attempts + 1 >= SMS_MAX_ATTEMPTS) {
+                        SmsInbox.remove(this, sms.id)
+                        CallLogStore.updateSms(this, sms.id) {
+                            it.copy(status = "failed", error = "gave up after ${sms.attempts + 1} attempts")
+                        }
+                        broadcastLog(
+                            "SMS: ${sms.id} from ${sms.from} gave up after " +
+                                "${sms.attempts + 1} attempts — ${if (code == 0) "no response" else code}"
+                        )
                     } else {
                         SmsInbox.markAttempt(this, sms.id)
                         CallLogStore.updateSms(this, sms.id) { it.copy(status = "queued") }
@@ -576,26 +587,30 @@ class GatewayService : Service() {
                             "SMS: ${sms.id} from ${sms.from} not accepted " +
                                 "(${if (code == 0) "no response" else code.toString()}) — queued"
                         )
-                        failed = true
+                        failedAttempts = sms.attempts + 1
                         break   // keep order; a later one is no more likely to land
                     }
                 }
-                if (failed) scheduleSmsRetry()
+                if (failedAttempts >= 0) scheduleSmsRetry(failedAttempts)
             } catch (e: Exception) {
                 Log.e(TAG, "SMS flush failed: ${e.message}", e)
-                scheduleSmsRetry()
+                // Back off from the queue's own state: a flush that keeps
+                // throwing must not reset to the base delay.
+                val stuck = runCatching { SmsInbox.pending(this).firstOrNull()?.attempts }
+                    .getOrNull() ?: 0
+                scheduleSmsRetry(stuck + 1)
             } finally {
                 smsFlushing.set(false)
             }
         }
     }
 
-    private fun scheduleSmsRetry() {
+    private fun scheduleSmsRetry(attempts: Int = 0) {
         if (smsRetryScheduled) return
         smsRetryScheduled = true
         thread(name = "sms-retry") {
             try {
-                Thread.sleep(SMS_RETRY_MS)
+                Thread.sleep(smsRetryDelayMs(attempts))
             } catch (_: InterruptedException) {
                 return@thread
             } finally {
@@ -605,6 +620,21 @@ class GatewayService : Service() {
             flushSmsQueue("retry")
             sweepOutboxReports()
         }
+    }
+
+    /** Every 4xx except the two the spec marks retryable (408, 429): the request
+     *  is the problem, not the moment. 415 is the live one — chan_sip answers it
+     *  for a non-text/plain out-of-call MESSAGE. */
+    private fun isPermanentSmsRejection(code: Int): Boolean =
+        code in 400..499 && code != 408 && code != 429
+
+    /** Retry delay for [attempts] failures: doubling from the base to the cap.
+     *  A fixed 30s turned a rejected message into a permanent SIP flood. */
+    private fun smsRetryDelayMs(attempts: Int): Long {
+        if (attempts <= 0) return SMS_RETRY_MS
+        val step = attempts.coerceAtMost(SMS_RETRY_MAX_SHIFT)
+        val delay = SMS_RETRY_MS shl step
+        return if (delay > SMS_RETRY_MAX_MS || delay <= 0L) SMS_RETRY_MAX_MS else delay
     }
 
     /**
@@ -836,6 +866,18 @@ class GatewayService : Service() {
         thread(name = "sms-report") { reportOutboxNow(id) }
     }
 
+    /** Count a failed report attempt; true once the ceiling is reached, which stops
+     *  the caller scheduling another.  The cost is the server's: its report flags
+     *  stay false, so it sees the message in flight until the 24h prune. */
+    private fun countReportAttempt(id: String, sms: OutboundSms, which: String): Boolean {
+        val attempts = sms.reportAttempts + 1
+        SmsOutbox.markReportAttempt(this, id)
+        if (attempts < SMS_MAX_REPORT_ATTEMPTS) return false
+        Log.w(TAG, "Giving up on $which report for ${sms.id} after $attempts attempts")
+        broadcastLog("SMS: giving up on $which report for ${sms.id} after $attempts attempts")
+        return true
+    }
+
     /**
      * Tell the server what has become of a message.
      *
@@ -858,8 +900,8 @@ class GatewayService : Service() {
                         // A failed send is terminal: no delivery report follows.
                         it.copy(submitReported = true, finalReported = failed)
                     }
-                } else {
-                    scheduleSmsRetry()
+                } else if (!countReportAttempt(id, sms, "submit")) {
+                    scheduleSmsRetry(sms.reportAttempts + 1)
                 }
             }
             val current = SmsOutbox.get(this, id) ?: return
@@ -867,66 +909,12 @@ class GatewayService : Service() {
                 val event = if (current.deliveredFailed > 0) "undelivered" else "delivered"
                 if (sendSmsReport(current, event)) {
                     SmsOutbox.update(this, id) { it.copy(finalReported = true) }
-                } else {
-                    scheduleSmsRetry()
+                } else if (!countReportAttempt(id, current, "final")) {
+                    scheduleSmsRetry(current.reportAttempts + 1)
                 }
             }
             SmsOutbox.prune(this)
         }
-    }
-
-    /**
-     * The gateway's own number for the SIM that carried this message.
-     *
-     * With one SIM this is just its own box.  With more than one it has to be
-     * the number of the SIM the message actually arrived on or left by, or
-     * the server maps it to the wrong assistant -- both SIMs reach the same
-     * gateway, and only the number distinguishes them.
-     *
-     * The same two steps an inbound call takes, in the same order and through
-     * the same OwnNumber helper, so a message and a call from one SIM can
-     * never name two different DIDs.  This function did not read the SIM at
-     * all until now -- box only -- while the comment on sendSmsOverSip()
-     * already promised it did.
-     *
-     * It returns empty rather than borrowing another slot's box.  Both
-     * callers already fall through to the SIP account on empty, which is the
-     * loud answer: guessing the lowest slot's number instead would map the
-     * message to the other SIM's assistant without saying so.
-     */
-    private fun ownNumberForSub(subId: Int): String {
-        OwnNumber.fromSim(this, subId)?.let {
-            Log.i(TAG, "SMS own number from SIM (sub=$subId): $it")
-            return it
-        }
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        // No SIM to name: there is no slot to look a box up under, so hand
-        // back nothing and let the caller's own fallback stand.  Every empty
-        // return below logs first — "which SIM sent this?" has to be
-        // answerable from the log afterwards, and a silent substitution is
-        // exactly the failure mode this chain was tightened to remove.
-        if (subId < 0) {
-            Log.w(TAG, "SMS own number unavailable (sub=$subId is not a subscription) — using the SIP account")
-            return ""
-        }
-        val slot = OwnNumber.simSlotForSubscription(this, subId)
-        if (slot == null || slot < 0) {
-            Log.w(TAG, "SMS own number unavailable (sub=$subId has no slot) — using the SIP account")
-            return ""
-        }
-        val configured = prefs.getString("own_number_slot_$slot", "")
-            ?.let { OwnNumber.toE164(this, it, subId) }
-            .orEmpty()
-        if (configured.isEmpty()) {
-            Log.w(TAG, "SMS own number unavailable (sub=$subId, slot $slot box empty) — using the SIP account")
-        } else {
-            // Deliberately Log.i, and deliberately naming the slot: on a
-            // carrier that publishes no number this line is the only evidence
-            // that the *box* was consulted rather than the SIM, which is the
-            // whole difference between correct-by-construction and silent.
-            Log.i(TAG, "SMS own number from settings (sub=$subId, slot $slot): $configured")
-        }
-        return configured
     }
 
     /**
@@ -1844,6 +1832,17 @@ class GatewayService : Service() {
 
         /** How long to wait before retrying a message the server did not take. */
         private const val SMS_RETRY_MS = 30_000L
+
+        /** Backoff ceiling for the retry timer. */
+        private const val SMS_RETRY_MAX_MS = 15 * 60_000L
+        private const val SMS_RETRY_MAX_SHIFT = 5
+
+        /** Attempts before a queued message is given up on; 8 rides out a server
+         *  outage without still retrying at the end of the day. */
+        private const val SMS_MAX_ATTEMPTS = 8
+
+        /** Attempts before a delivery report is given up on. */
+        private const val SMS_MAX_REPORT_ATTEMPTS = 10
 
         /** X-SMS-Received: ISO 8601 UTC, so the server does not have to guess
          *  at the gateway's local time zone. */

@@ -36,7 +36,10 @@ data class OutboundSms(
     /** "GSM7", "UCS2", "8BIT" — how the text went out on the air. */
     val encoding: String = "",
     val submitReported: Boolean = false,
-    val finalReported: Boolean = false
+    val finalReported: Boolean = false,
+    /** Failed attempts to report this message to the server, across both
+     *  reports.  Drives the retry backoff and the give-up ceiling. */
+    val reportAttempts: Int = 0
 )
 
 /**
@@ -70,6 +73,12 @@ object SmsOutbox {
 
     @Synchronized
     fun all(context: Context): List<OutboundSms> = read(context)
+
+    /** Count a failed report attempt.  Deliberately leaves [OutboundSms.lastError]
+     *  alone: that is the send failure shown in the message-detail dialog. */
+    @Synchronized
+    fun markReportAttempt(context: Context, id: String): OutboundSms? =
+        update(context, id) { it.copy(reportAttempts = it.reportAttempts + 1) }
 
     @Synchronized
     fun update(context: Context, id: String, transform: (OutboundSms) -> OutboundSms): OutboundSms? {
@@ -142,6 +151,7 @@ object SmsOutbox {
         put("delOk", s.deliveredOk); put("delFailed", s.deliveredFailed)
         put("status", s.status); put("smsc", s.smsc); put("encoding", s.encoding)
         put("submitReported", s.submitReported); put("finalReported", s.finalReported)
+        put("reportAttempts", s.reportAttempts)
     }
 
     private fun fromJson(o: JSONObject) = OutboundSms(
@@ -163,6 +173,7 @@ object SmsOutbox {
         smsc = o.optString("smsc"),
         encoding = o.optString("encoding"),
         submitReported = o.optBoolean("submitReported"),
-        finalReported = o.optBoolean("finalReported")
+        finalReported = o.optBoolean("finalReported"),
+        reportAttempts = o.optInt("reportAttempts")
     )
 }

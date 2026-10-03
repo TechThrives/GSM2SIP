@@ -107,8 +107,14 @@ object OwnNumber {
             else subMgr?.getPhoneNumber(SubscriptionManager.getDefaultSubscriptionId())
         } else {
             val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            // No getOrDefault(base): that handle is bound to the default
+            // subscription, so a fallback answers with SIM 1's number for a SIM
+            // 2 call. A miss stays a miss, so the per-slot box is consulted.
             val scoped = if (isValidSubscription(subId)) {
-                runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
+                runCatching { base.createForSubscriptionId(subId) }
+                    .onFailure { Log.w(TAG, "createForSubscriptionId($subId) failed; no SIM number: ${it.message}") }
+                    .getOrNull()
+                    ?: return null
             } else base
             scoped.line1Number
         }
@@ -144,8 +150,13 @@ object OwnNumber {
 
         val iso = runCatching {
             val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            // Same rule as fromSim: a failed rebind must not read
+            // another SIM's country and build a valid-looking number from it.
             val scoped = if (isValidSubscription(subId)) {
-                runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
+                runCatching { base.createForSubscriptionId(subId) }
+                    .onFailure { Log.w(TAG, "createForSubscriptionId($subId) failed; no country ISO: ${it.message}") }
+                    .getOrNull()
+                    ?: return@runCatching null
             } else {
                 base
             }

@@ -60,7 +60,7 @@ object SmsInbox {
         }
     }
 
-    /** Drop one message — called only after the server has accepted it. */
+    /** Drop one message — called only after the server has accepted or given up on it. */
     @Synchronized
     fun remove(context: Context, id: String) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
