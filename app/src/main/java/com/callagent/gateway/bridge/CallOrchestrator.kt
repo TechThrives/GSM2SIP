@@ -847,8 +847,8 @@ class CallOrchestrator(
     // ── Inbound flow (GSM → SIP) ───────────────────────
 
     private fun handleInboundFlow(gsmCall: Call) {
-        val callerNumber = gsmCall.details?.handle?.schemeSpecificPart ?: "unknown"
-        Log.i(TAG, "Inbound flow: placing SIP call for GSM caller $callerNumber")
+        val (callerNumber, callerName) = GsmCallManager.callerOf(gsmCall)
+        Log.i(TAG, "Inbound flow: placing SIP call for GSM caller $callerNumber ($callerName)")
 
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
@@ -858,7 +858,7 @@ class CallOrchestrator(
             targetExtension = inboundSipDestination(gsmCall),
             localRtpPort = rtpPort,
             callerIdNumber = callerNumber,
-            callerIdName = callerNumber
+            callerIdName = callerName
         )
         sipCall.listener = this
         activeSipCall = sipCall
