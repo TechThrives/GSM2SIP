@@ -31,6 +31,7 @@ import com.callagent.gateway.RootShell
 import com.callagent.gateway.bridge.CallOrchestrator
 import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.net.StunClient
+import com.callagent.gateway.sip.GatewayAnnouncement
 import com.callagent.gateway.sip.SipClient
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -623,8 +624,9 @@ class GatewayService : Service() {
     }
 
     /** Every 4xx except the two the spec marks retryable (408, 429): the request
-     *  is the problem, not the moment. 415 is the live one — chan_sip answers it
-     *  for a non-text/plain out-of-call MESSAGE. */
+     *  is the problem, not the moment. 415 is the live one — check_content_type()
+     *  in res_pjsip_messaging.c accepts only text/plain for an out-of-dialog
+     *  MESSAGE and answers 415 for anything else. */
     private fun isPermanentSmsRejection(code: Int): Boolean =
         code in 400..499 && code != 408 && code != 429
 
@@ -1006,10 +1008,11 @@ class GatewayService : Service() {
         if (sms.smsc.isNotEmpty()) headers += "X-SMS-Smsc: ${sms.smsc}"
         if (sms.encoding.isNotEmpty()) headers += "X-SMS-Encoding: ${sms.encoding}"
 
-        // text/plain, not application/json: chan_sip refuses anything else on
-        // an out-of-call MESSAGE — measured, it answered 415.  The body is
+        // text/plain, not application/json: check_content_type() in
+        // res_pjsip_messaging.c accepts only text/plain on an out-of-dialog
+        // MESSAGE and answers 415 for anything else.  The body is
         // still JSON for anyone who wants to parse it, but every field is in
-        // an X-SMS-* header too, so SIP_HEADER() alone is enough.
+        // an X-SMS-* header too, so PJSIP_HEADER(read,...) alone is enough.
         val code = sip.sendSipMessage(
             targetUri = "sip:$cfgUser@$cfgServer",
             fromUser = source,
@@ -1348,6 +1351,12 @@ class GatewayService : Service() {
 
         sip.logListener = { msg -> broadcastLog("SIP: $msg") }
         sip.onSmsRequest = { m -> onSmsSendRequest(m) }
+        // Tell the server who this device is on every answered REGISTER.
+        // Off the receive thread by construction: SipClient wraps this in
+        // "GW-Announce", because it blocks on a MESSAGE transaction.
+        sip.onRegistrationAcked = {
+            GatewayAnnouncement.announceRegistered(this, sip, cfgUser)
+        }
         GsmCallManager.logCallback = { msg -> broadcastLog("AUDIO: $msg") }
         RootShell.statusCallback = { msg -> broadcastLog("ROOT: $msg") }
         sip.onConnectionLost = { reconnect() }

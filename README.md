@@ -465,45 +465,65 @@ the same message.
 Reports are retried like anything else: answer `200`/`202`, or the gateway
 sends them again, including after the next registration.
 
-### Asterisk (chan_sip)
+### Asterisk (chan_pjsip)
 
-Out-of-call MESSAGEs are off by default, and they arrive on the same peer the
-calls use — `[gateway-gw1]` from the call example above needs nothing added.
+Everything below is chan_pjsip / res_pjsip. Three properties of that driver
+govern the whole SMS path and are worth stating once, because each one is a
+mistake if assumed otherwise:
+
+- Out-of-call MESSAGEs are enabled per **endpoint** with `message_context`.
+  That is the only switch; nothing is needed in a general section, and inbound
+  MESSAGE is authenticated by the registration the calls already use.
+- The channel's **exten is the Request-URI's user part**.
+  `rx_data_to_ast_msg` in res_pjsip_messaging.c copies it out of the R-URI, so
+  a MESSAGE addressed to `sip:1001@example.com` lands on exten `1001` in the
+  message context — not on a literal `s`.
 
 ```ini
-; sip.conf
-[general]
-accept_outofcall_message=yes
-outofcall_message_context=messages
-auth_message_requests=yes
+; pjsip.conf — on the endpoint the gateway registers as
+[1001]
+type=endpoint
+...
+message_context=sms-from-gsm
 ```
 
-#### Receiving: SMS and delivery reports
+The gateway is registered, so it also needs no identify rule for inbound
+MESSAGEs: res_pjsip resolves the endpoint from the authenticated request, and
+MESSAGE is accepted on the same registration the calls use.
 
-Both arrive at the registered account, so one context handles them. The
-mandatory `X-SMS-From`/`X-SMS-To` pair carries routing, and `X-SMS-Event`
-separates an inbound message from a report on something we sent.
+#### Receiving: SMS, reports and gateway announcements
+
+Everything arrives at the registered account, so one context handles it. The
+mandatory `X-SMS-From`/`X-SMS-To` pair carries SMS routing, `X-SMS-Event`
+separates an inbound message from a report on something we sent, and
+`X-GW-Event` marks a gateway lifecycle announcement — which is not an SMS and
+must not be handled as one.
+
+Note `${MESSAGE(body)}` for the text; the `X-SMS-*` and `X-GW-*` values are SIP
+headers, so they are read with `PJSIP_HEADER(read,...)`.
 
 ```ini
-; extensions.conf — exten is the registered account user (1001)
-[messages]
-exten => _+X.,1,NoOp(${MESSAGE(from)} -> ${MESSAGE(to)})
- same => n,Set(ID=${SIP_HEADER(X-SMS-Id)})
- same => n,Set(EVENT=${SIP_HEADER(X-SMS-Event)})
- same => n,GotoIf($["${EVENT}" != ""]?report)
+; extensions.conf — exten is the registered account user (1001).
+; Log-only: SMS, reports and announcements are consumed over ARI by the API,
+; which is subscribed to every endpoint Asterisk knows. One message context
+; per device — copy the block for each new gateway.
+[sms-from-gsm-1001]
+exten => _X.,1,NoOp(MESSAGE ${MESSAGE(from)} -> ${MESSAGE(to)})
+ same => n,Set(GW_EVENT=${PJSIP_HEADER(read,X-GW-Event)})
+ same => n,GotoIf($["${GW_EVENT}" != ""]?gateway,sms)
+
+; A registration announcement: device identity, audio profile, own numbers.
+; Not an SMS — hand it to whatever tracks devices, or just log it.
+ same => n(gateway),NoOp(GW ${GW_EVENT} id=${PJSIP_HEADER(read,X-GW-Id)} profile=${PJSIP_HEADER(read,X-GW-Profile)} numbers=${PJSIP_HEADER(read,X-GW-Numbers)})
+ same => n,Hangup()
 
 ; A received SMS. X-SMS-From is the human sender and X-SMS-To is the
 ; receiving SIM. MESSAGE(body) is the reassembled text.
- same => n,Set(FROM=${SIP_HEADER(X-SMS-From)})
- same => n,Set(TO=${SIP_HEADER(X-SMS-To)})
- same => n,AGI(sms_in.agi,${ID},${FROM},${TO},${MESSAGE(body)})
- same => n,Hangup()
-
-; A report on something we asked the gateway to send.  ID is the same id the
-; send carried, so it matches the report back to the message.
- same => n(report),Set(STATUS=${SIP_HEADER(X-SMS-Status)})
- same => n,Set(REASON=${SIP_HEADER(X-SMS-Reason)})
- same => n,AGI(sms_status.agi,${ID},${EVENT},${STATUS},${REASON})
+ same => n(sms),Set(ID=${PJSIP_HEADER(read,X-SMS-Id)})
+ same => n,Set(EVENT=${PJSIP_HEADER(read,X-SMS-Event)})
+ same => n,Set(FROM=${PJSIP_HEADER(read,X-SMS-From)})
+ same => n,Set(TO=${PJSIP_HEADER(read,X-SMS-To)})
+ same => n,NoOp(SMS id=${ID} event=${EVENT} From=${FROM} To=${TO})
  same => n,Hangup()
 ```
 
@@ -511,35 +531,27 @@ exten => _+X.,1,NoOp(${MESSAGE(from)} -> ${MESSAGE(to)})
 follows it — so a handler that closes the message out on the first report
 closes it too early. `failed` and `delivered`/`undelivered` are terminal.
 
+#### Content-Type
+
+An out-of-call MESSAGE must be `text/plain`. `check_content_type()` in
+res_pjsip_messaging.c accepts only that and answers `415` for anything else,
+so an `application/json` body is refused outright. (`check_content_type_in_dialog`
+is laxer and takes `text/*` and `application/*`, but that is the in-dialog
+path and does not apply to an out-of-call MESSAGE.) Put the JSON in the body
+with `text/plain` and mirror every field into a header — which is what the
+gateway does for both SMS and announcements, and what makes `PJSIP_HEADER()`
+sufficient without parsing anything.
+
 #### Sending
 
-`MessageSend()` addresses the SIP peer, so the Request-URI carries the account
-name rather than the human recipient. Both routing values are mandatory
-headers: `X-SMS-From` selects the sending SIM and `X-SMS-To` names the human
-recipient.
+Outbound SMS never touches the dialplan: the API sends it over ARI
+(`PUT /endpoints/{tech}/{resource}/sendMessage`) with `?from=` naming the
+endpoint that owns the sending SIM. The Request-URI carries the account name
+and both routing values travel as mandatory headers: `X-SMS-From` selects the
+sending SIM and `X-SMS-To` names the human recipient.
 
-```ini
-; extensions.conf — Gosub(sms-out,s,1(+4917098765432,Reply from the agent,+4915112345678))
-[sms-out]
-exten => s,1,NoOp(SMS to ${ARG1})
- same => n,Set(MESSAGE(body)=${ARG2})
- same => n,Set(MESSAGE(custom_data)=mark_all_outbound)
- same => n,Set(MESSAGE_DATA(X-SMS-From)=${ARG3})
- same => n,Set(MESSAGE_DATA(X-SMS-To)=${ARG1})
-; X-SMS-Id is mandatory. Reuse the same stable id for retries so the
-; gateway can deduplicate the request and match delivery reports.
- same => n,Set(MESSAGE_DATA(X-SMS-Id)=${UNIQUEID})
- same => n,MessageSend(sip:gateway-gw1,sip:agent@example.com)
- same => n,NoOp(send status: ${MESSAGE_SEND_STATUS})
- same => n,Return()
-```
-
-`MESSAGE_SEND_STATUS` is `SUCCESS` for the `202`, which means the gateway has
-the message on disk and owns delivering it — not that it reached anyone. What
-it cost comes back as `X-SMS-Parts` and `X-SMS-Encoding` on that `202`, and
-Asterisk does not expose response headers to the dialplan, so a sender that
-cares about part count has to measure the text itself: one character outside
-GSM-7 takes the whole message to UCS-2 and 70 characters a part.
+`X-SMS-Id` is mandatory. The sender reuses the same stable id for retries so
+the gateway can deduplicate the request and match delivery reports.
 
 Nothing above is dialplan-only — AMI's `MessageSend` action and ARI's
 `PUT /endpoints/{tech}/{resource}/sendMessage` take the same body and variables.

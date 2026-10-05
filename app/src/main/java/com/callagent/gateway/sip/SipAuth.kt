@@ -60,8 +60,8 @@ object SipAuth {
      *
      * `parseChallenge` has always extracted `qop` and `buildAuthHeader` has
      * always ignored it, so every registrar that offers qop got the 2069
-     * formula back.  That works against a bare chan_sip/Asterisk default and
-     * fails against most everything else.
+     * formula back.  That works against a bare Asterisk default that advertises
+     * no qop, and fails against most everything else.
      */
     fun buildAuthHeader(
         method: String,

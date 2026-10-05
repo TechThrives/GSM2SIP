@@ -88,6 +88,16 @@ class SipClient(
      */
     @Volatile var onSmsRequest: ((SipMessage) -> Pair<Int, List<String>>)? = null
 
+    /**
+     * A REGISTER was answered 200, so the gateway is on the server.
+     *
+     * Invoked on a thread of its own, never on the receive thread: the
+     * announcement it triggers is a MESSAGE transaction that blocks until the
+     * server answers, and [handleRegisterResponse] runs on `SIP-Recv`. Blocking
+     * here would stall every other SIP packet behind a 10s wait.
+     */
+    @Volatile var onRegistrationAcked: (() -> Unit)? = null
+
     private fun uiLog(msg: String) {
         Log.i(TAG, msg)
         logListener?.invoke(msg)
@@ -145,6 +155,9 @@ class SipClient(
         // the way out tore down the *replacement* client.
         onConnectionLost = null
         listener = null
+        // Same reason: a registration answered after stop() would otherwise
+        // announce a gateway the operator just took down.
+        onRegistrationAcked = null
         // Release anyone blocked waiting for a REGISTER response so the
         // thread reaches its running.get() check instead of sitting out the
         // full 10s timeout.
@@ -448,6 +461,14 @@ class SipClient(
                 uiLog("Registered with $serverDomain")
                 registrationLatch?.countDown()
                 listener?.onRegistered()
+                // Fire-and-forget on every answered REGISTER, refreshes
+                // included. The monitor loop re-REGISTERs every
+                // REREGISTER_INTERVAL_MS, so this is one small MESSAGE a
+                // minute per device. The server rebuilds its number map from
+                // announcements alone, so a refresh that stays silent would
+                // leave a restarted server with no mapping until the next
+                // cold registration.
+                Thread({ onRegistrationAcked?.invoke() }, "GW-Announce").start()
                 true
             }
             401, 407 -> {
@@ -538,8 +559,8 @@ class SipClient(
         call.toHeader = "<sip:$targetExtension@$serverDomain>"
 
         // Generated once, here, and reused for every retry and re-INVITE of
-        // this call: rekeying mid-dialog is not something chan_sip handles
-        // predictably, and there is no reason to.
+        // this call: rekeying mid-dialog is not handled predictably by any
+        // SIP stack, and there is no reason to.
         if (srtpEnabled) call.localSrtpKeys = SrtpKeys.generate(SrtpCryptoSuite.offered)
 
         val targetUri = "sip:$targetExtension@$serverDomain"
