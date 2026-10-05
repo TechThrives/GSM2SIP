@@ -127,6 +127,24 @@ object GsmCallManager {
      *  worth depending on. */
     @Volatile private var endedCall: Call? = null
 
+    /**
+     * The caller as the SIP side should see it: (number, display name).  A
+     * withheld / unknown / payphone caller has no usable number; it is sent
+     * as "anonymous" with a name instead of the literal word "unknown", which
+     * softphones showed and offered to call back.
+     */
+    fun callerOf(call: Call?): Pair<String, String> {
+        val d = call?.details
+        val number = d?.handle?.schemeSpecificPart.orEmpty()
+        return when {
+            d?.handlePresentation == android.telecom.TelecomManager.PRESENTATION_RESTRICTED -> "anonymous" to "Withheld"
+            d?.handlePresentation == android.telecom.TelecomManager.PRESENTATION_PAYPHONE -> "anonymous" to "Payphone"
+            number.isBlank() || d?.handlePresentation == android.telecom.TelecomManager.PRESENTATION_UNKNOWN ->
+                "anonymous" to "Unknown"
+            else -> number to number
+        }
+    }
+
 
 
     private fun notifyCallEnded(call: Call) {
