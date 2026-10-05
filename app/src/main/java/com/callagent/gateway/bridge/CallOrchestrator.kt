@@ -865,13 +865,25 @@ class CallOrchestrator(
 
         Log.i(TAG, "SIP INVITE sent to Asterisk (caller=$callerNumber, rtp=$rtpPort)")
 
-        // Timeout: if Asterisk doesn't answer within 30s, tear down
-        schedule(SIP_CALL_TIMEOUT_MS) {
-            if (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING) {
-                Log.w(TAG, "SIP call timeout — Asterisk didn't answer in ${SIP_CALL_TIMEOUT_MS / 1000}s")
-                tearDown("Asterisk not answering")
+        // Timeout: if the server has not even said "ringing" within 30 s, give
+        // up.  Once it rings (180), the server's own dial timeout decides; ours
+        // only stops a call that rings for ever.  Cutting at 30 s regardless
+        // ended calls the softphone was still ringing for — a push-woken
+        // phone got about 20 s to answer.
+        val sentAt = System.currentTimeMillis()
+        fun check() {
+            if (bridgeState != BridgeState.SIP_CALLING && bridgeState != BridgeState.SIP_RINGING) return
+            if (activeSipCall !== sipCall) return
+            val elapsed = System.currentTimeMillis() - sentAt
+            val ringing = sipCall.state == SipCall.State.RINGING
+            if (ringing && elapsed < SIP_RING_MAX_MS) {
+                schedule(5_000) { check() }
+                return
             }
+            Log.w(TAG, "SIP call timeout — ${if (ringing) "rang ${elapsed / 1000}s" else "no ringing from the server in ${elapsed / 1000}s"}")
+            tearDown(if (ringing) "No answer" else "Asterisk not answering")
         }
+        schedule(SIP_CALL_TIMEOUT_MS) { check() }
     }
 
     // ── Outbound flow (SIP → GSM) ──────────────────────
@@ -1210,6 +1222,8 @@ class CallOrchestrator(
     companion object {
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
+        /** Safety net once the server reports ringing (its own dial timeout normally ends it first). */
+        private const val SIP_RING_MAX_MS = 70_000L
         private const val GSM_DIAL_TIMEOUT_MS = 45_000L
         /** If bridge is non-IDLE for this long, consider it stale */
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
