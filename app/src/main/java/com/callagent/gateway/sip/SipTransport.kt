@@ -1,5 +1,6 @@
 package com.callagent.gateway.sip
 
+import android.net.Network
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -57,6 +58,7 @@ interface SipTransport {
 /** The original datagram transport: one packet in, one message out. */
 class UdpSipTransport(
     override val localPort: Int,
+    private val network: Network? = null,
     private val soTimeoutMs: Int = 5000
 ) : SipTransport {
 
@@ -71,6 +73,7 @@ class UdpSipTransport(
         socket?.close()
         val s = DatagramSocket(null)
         s.reuseAddress = true
+        network?.bindSocket(s)
         s.bind(InetSocketAddress(localPort))
         s.soTimeout = soTimeoutMs
         s.receiveBufferSize = 65535

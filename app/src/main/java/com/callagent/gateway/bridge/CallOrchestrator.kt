@@ -556,28 +556,32 @@ class CallOrchestrator(
     }
 
     /**
-     * The SIP status that says why a GSM leg never connected.
-     *
-     * A provider that cannot complete a call answers the INVITE with a final
-     * response the dialplan can branch on — busy, declined, unobtainable.
-     * We used to send BYE instead, which is not a valid way to end an INVITE
-     * that was never answered: the server replies 481 and then waits out its
-     * own timer, so a busy number, a declined call and a dead SIM all looked
-     * alike and all looked like a timeout.
+     * Why a GSM call we placed failed, as the SIP final response the server
+     * gets. Android folds unreachable / invalid
+     * / out-of-service / switched off / congestion into code ERROR; the public
+     * reason string still names the telephony cause ("BUSY",
+     * "UNOBTAINABLE_NUMBER", ...), so it is used first. Before, ERROR became
+     * 500, which Asterisk treats like CHANUNAVAIL.
      */
-    private fun sipStatusFor(cause: DisconnectCause?): Pair<Int, String> =
-        when (cause?.code) {
-            DisconnectCause.BUSY -> 486 to "Busy Here"
-            DisconnectCause.REJECTED -> 603 to "Decline"
-            DisconnectCause.RESTRICTED -> 403 to "Forbidden"
-            DisconnectCause.MISSED -> 480 to "Temporarily Unavailable"
-            DisconnectCause.CANCELED, DisconnectCause.LOCAL -> 487 to "Request Terminated"
-            DisconnectCause.CONNECTION_MANAGER_NOT_SUPPORTED -> 503 to "Service Unavailable"
-            DisconnectCause.ERROR -> 500 to "Server Internal Error"
-            // REMOTE covers both "they hung up" and the causes the platform
-            // does not break out, so it stays the generic unobtainable.
+    private fun sipStatusFor(cause: DisconnectCause?): Pair<Int, String> {
+        val r = cause?.reason.orEmpty().uppercase()
+        Log.i(TAG, "GSM disconnect: code=${cause?.code} reason=${cause?.reason} label=${cause?.label}")
+        fun has(vararg k: String) = k.any { r.contains(it) }
+        return when {
+            cause?.code == DisconnectCause.BUSY || has("USER_BUSY", "BUSY") -> 486 to "Busy Here"
+            cause?.code == DisconnectCause.REJECTED || has("CALL_REJECTED", "INCOMING_REJECTED") -> 603 to "Decline"
+            has("UNOBTAINABLE_NUMBER", "UNASSIGNED_NUMBER", "NO_ROUTE_TO_DESTINATION") -> 404 to "Number Not In Service"
+            has("INVALID_NUMBER", "INVALID_NUMBER_FORMAT") -> 484 to "Address Incomplete"
+            cause?.code == DisconnectCause.RESTRICTED || has("CALL_BARRED", "FDN_BLOCKED", "RESTRICTED") -> 403 to "Call Barred"
+            has("NUMBER_UNREACHABLE", "POWER_OFF", "NO_ANSWER", "TIMED_OUT", "NO_USER_RESPONDING") ||
+                cause?.code == DisconnectCause.MISSED -> 480 to "Not Reachable"
+            has("OUT_OF_SERVICE", "EMERGENCY_ONLY", "RADIO_OFF", "ICC_ERROR", "CONGESTION",
+                "OUT_OF_NETWORK", "NOT_VALID") ||
+                cause?.code == DisconnectCause.CONNECTION_MANAGER_NOT_SUPPORTED -> 503 to "Service Unavailable"
+            cause?.code == DisconnectCause.CANCELED || cause?.code == DisconnectCause.LOCAL -> 487 to "Request Terminated"
             else -> 480 to "Temporarily Unavailable"
         }
+    }
 
     override fun onGsmCallEnded(call: Call) {
         Log.i(TAG, "GSM call ended")
@@ -682,13 +686,23 @@ class CallOrchestrator(
 
         Log.i(TAG, "SIP INVITE sent to Asterisk (caller=$callerNumber, rtp=$rtpPort)")
 
-        // Timeout: if Asterisk doesn't answer within 30s, tear down
-        schedule(SIP_CALL_TIMEOUT_MS) {
-            if (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING) {
-                Log.w(TAG, "SIP call timeout — Asterisk didn't answer in ${SIP_CALL_TIMEOUT_MS / 1000}s")
-                tearDown("Asterisk not answering")
+        // Timeout: if the server has not even said "ringing" within 30 s, give
+        // up. Once it rings (180), the server's own dial timeout decides; ours
+        // only stops a call that rings for ever.
+        val sentAt = System.currentTimeMillis()
+        fun check() {
+            if (bridgeState != BridgeState.SIP_CALLING && bridgeState != BridgeState.SIP_RINGING) return
+            if (activeSipCall !== sipCall) return
+            val elapsed = System.currentTimeMillis() - sentAt
+            val ringing = sipCall.state == SipCall.State.RINGING
+            if (ringing && elapsed < SIP_RING_MAX_MS) {
+                schedule(5_000) { check() }
+                return
             }
+            Log.w(TAG, "SIP call timeout — ${if (ringing) "rang ${elapsed / 1000}s" else "no ringing from the server in ${elapsed / 1000}s"}")
+            tearDown(if (ringing) "No answer" else "Asterisk not answering")
         }
+        schedule(SIP_CALL_TIMEOUT_MS) { check() }
     }
 
     // ── Outbound flow (SIP → GSM) ──────────────────────
@@ -819,7 +833,13 @@ class CallOrchestrator(
             }
             activeSipCall = null
 
-            activeGsmCall?.let { call ->
+            // In the outbound flow Telecom can create the Call object and
+            // publish it to GsmCallManager just before the InCallService
+            // state callback reaches this class. Prefer our tracked object,
+            // but fall back to the manager's object so a SIP CANCEL during GSM
+            // ringing cannot leave the cellular leg ringing indefinitely.
+            val gsmCallToDisconnect = activeGsmCall ?: GsmCallManager.activeCall
+            gsmCallToDisconnect?.let { call ->
                 try {
                     // Always disconnect — not just when ACTIVE.  If the SIP
                     // call fails before GSM is answered, the ringing GSM call
@@ -983,6 +1003,8 @@ class CallOrchestrator(
     companion object {
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
+        /** Safety net once the server reports ringing (its own dial timeout normally ends it first). */
+        private const val SIP_RING_MAX_MS = 70_000L
         /** If bridge is non-IDLE for this long, consider it stale */
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
 

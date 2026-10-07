@@ -1190,6 +1190,8 @@ class GatewayService : Service() {
         checkDefaultDialer()
         checkSmsPermission()
 
+        val activeNetwork = (getSystemService(Context.CONNECTIVITY_SERVICE)
+            as ConnectivityManager).activeNetwork
         val localIp = getLocalIp()
         currentLocalIp = localIp
         broadcastLog("Local IP: $localIp")
@@ -1201,7 +1203,7 @@ class GatewayService : Service() {
         val useStun = getSharedPreferences("gateway", MODE_PRIVATE)
             .getBoolean("use_stun", true)
         val stunResult = if (!useStun) null else try {
-            StunClient.discover()
+            StunClient.discover(network = activeNetwork)
         } catch (e: Exception) {
             Log.e(TAG, "STUN exception: ${e.javaClass.simpleName}: ${e.message}")
             null
@@ -1236,6 +1238,7 @@ class GatewayService : Service() {
             serverPort = cfgPort,
             localIp = localIp,
             localPort = cfgPort,
+            network = activeNetwork,
             publicIp = publicIp,
             useTls = useTls,
             srtpRequested = prefs.getBoolean("srtp_enabled", false)

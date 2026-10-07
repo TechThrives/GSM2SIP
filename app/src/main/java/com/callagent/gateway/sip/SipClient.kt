@@ -1,5 +1,6 @@
 package com.callagent.gateway.sip
 
+import android.net.Network
 import android.os.Build
 import com.callagent.gateway.rtp.SrtpCryptoSuite
 import com.callagent.gateway.rtp.SrtpKeys
@@ -26,6 +27,8 @@ class SipClient(
     val serverPort: Int = 5060,
     var localIp: String = "0.0.0.0",
     val localPort: Int = 5060,
+    /** Android network carrying this SIP session; refreshed on reconnect. */
+    private val network: Network? = null,
     /** Public IP discovered via STUN — used in Contact headers and SDP for NAT traversal */
     var publicIp: String = localIp,
     /** SIP over TLS instead of UDP.  Signalling only — RTP is unaffected. */
@@ -177,7 +180,7 @@ class SipClient(
         val t: SipTransport = if (useTls) {
             TlsSipTransport(serverDomain, serverPort, SOCKET_TIMEOUT_MS) { uiLog(it) }
         } else {
-            UdpSipTransport(localPort, SOCKET_TIMEOUT_MS)
+            UdpSipTransport(localPort, network, SOCKET_TIMEOUT_MS)
         }
         t.open()
         transport = t
@@ -272,7 +275,7 @@ class SipClient(
         }
 
         // Registration responses
-        if (msg.isResponse && msg.cseq?.contains("REGISTER") == true) {
+        if (msg.isResponse && msg.cseq?.contains("REGISTER", ignoreCase = true) == true) {
             handleRegisterResponse(msg)
             return
         }
