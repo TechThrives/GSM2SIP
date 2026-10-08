@@ -26,7 +26,7 @@ class SipClient(
     val serverDomain: String,
     val serverPort: Int = 5060,
     var localIp: String = "0.0.0.0",
-    val localPort: Int = 5060,
+    val localPort: Int = 5040,
     /** Android network carrying this SIP session; refreshed on reconnect. */
     private val network: Network? = null,
     /** Public IP discovered via STUN — used in Contact headers and SDP for NAT traversal */

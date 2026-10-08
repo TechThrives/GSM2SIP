@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # Magisk module installation script
-# Installs the gateway app as a system priv-app with elevated permissions
+# Installs the GSM2SIP app as a system priv-app with elevated permissions
 # (required for CAPTURE_AUDIO_OUTPUT — telephony audio capture)
 
 SKIPUNZIP=1
@@ -23,7 +23,7 @@ LATESTARTSERVICE=false
 # Show version
 MOD_VER=$(grep '^version=' "$MODPATH/../module.prop" 2>/dev/null | cut -d= -f2)
 [ -z "$MOD_VER" ] && MOD_VER=$(unzip -p "$ZIPFILE" module.prop 2>/dev/null | grep '^version=' | cut -d= -f2)
-ui_print "- SIP-GSM Gateway Magisk Module ${MOD_VER:-unknown}"
+ui_print "- GSM2SIP Magisk Module ${MOD_VER:-unknown}"
 ui_print ""
 
 # Extract module files
@@ -35,8 +35,8 @@ unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH
 # from git without build.sh, or if the user wants to update the APK
 # independently, we fall back to copying the already-installed APK.
 
-PRIV_DIR="$MODPATH/system/priv-app/Gateway"
-PRIV_APK="$PRIV_DIR/Gateway.apk"
+PRIV_DIR="$MODPATH/system/priv-app/GSM2SIP"
+PRIV_APK="$PRIV_DIR/GSM2SIP.apk"
 
 if [ -f "$PRIV_APK" ]; then
     ui_print "- APK found in module (from build.sh)"
@@ -49,8 +49,8 @@ else
         cp "$APK_PATH" "$PRIV_APK"
         ui_print "- Copied installed APK to priv-app: $APK_PATH"
     else
-        ui_print "! WARNING: Gateway APK not found!"
-        ui_print "! Install the APK first (adb install gateway.apk),"
+        ui_print "! WARNING: GSM2SIP APK not found!"
+        ui_print "! Install the APK first (adb install gsm2sip.apk),"
         ui_print "! then reinstall this Magisk module."
     fi
 fi
@@ -165,7 +165,7 @@ fi
 rm -f "$MODPATH/skip_mount"
 
 ui_print ""
-ui_print "- SIP-GSM Gateway installed as priv-app"
+ui_print "- GSM2SIP installed as priv-app"
 ui_print "- Privileged permissions configured:"
 ui_print "    CAPTURE_AUDIO_OUTPUT, MODIFY_PHONE_STATE,"
 ui_print "    READ_PRIVILEGED_PHONE_STATE, CALL_PRIVILEGED"

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Privileged permissions for the SIP-GSM Gateway app.
+    Privileged permissions for the GSM2SIP app.
     Installed as system priv-app via Magisk module.
 -->
 <permissions>

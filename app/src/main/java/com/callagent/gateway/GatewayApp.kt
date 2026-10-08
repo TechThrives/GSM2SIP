@@ -14,6 +14,6 @@ class GatewayApp : Application() {
         StrictMode.setThreadPolicy(
             StrictMode.ThreadPolicy.Builder().permitAll().build()
         )
-        Log.i("GatewayApp", "SIP-GSM Gateway v${BuildConfig.VERSION_NAME} started")
+        Log.i("GatewayApp", "GSM-SIP Gateway v${BuildConfig.VERSION_NAME} started")
     }
 }

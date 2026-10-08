@@ -1237,7 +1237,7 @@ class GatewayService : Service() {
             serverDomain = cfgServer,
             serverPort = cfgPort,
             localIp = localIp,
-            localPort = cfgPort,
+            localPort = 5040,
             network = activeNetwork,
             publicIp = publicIp,
             useTls = useTls,

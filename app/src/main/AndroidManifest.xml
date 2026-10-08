@@ -64,7 +64,7 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:resizeableActivity="false"
-        android:theme="@style/Theme.SipGsmGateway"
+        android:theme="@style/Theme.GsmSipGateway"
         tools:targetApi="34">
 
         <activity

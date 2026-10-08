@@ -14,7 +14,7 @@ Bridges Android phone to any SIP server as GSM Gateway
 
 ## How It Works
 
-A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gateway:
+A dedicated rooted Android phone with a local SIM card acts as a GSM-to-SIP gateway:
 
 - **Inbound**: Someone calls the SIM's number → the phone answers → the call is bridged to the SIP server, which routes it wherever the dialplan says (an AI agent, a queue, an extension)
 - **Outbound**: the SIP server sends an INVITE with `X-GSM-From: +<SIM-number>` and `X-GSM-To: +<destination>` → the phone dials the destination over GSM → audio is bridged back to SIP
@@ -203,7 +203,7 @@ though the file looks right. The bundled scripts write it correctly; `ANDROID_HO
 also works and takes precedence.
 
 Outputs:
-- `gateway-magisk.zip` — Magisk module containing the APK, permissions, and audio tools (tinymix, tinycap). This is the only file you need to install.
+- `gsm2sip-magisk.zip` — Magisk module containing the APK, permissions, and audio tools (tinymix, tinycap). This is the only file you need to install.
 
 The APK itself is architecture-independent, but `tinymix` is not: the ALSA
 control ioctls encode the size of structs containing `long`, so an arm64 build
@@ -217,7 +217,7 @@ command dies with `not executable: 64-bit ELF file`.
 
 Only the Magisk module needs to be installed — it includes the APK and handles all permissions automatically.
 
-1. **Install Magisk module**: Copy `gateway-magisk.zip` to device, install via Magisk Manager → Modules
+1. **Install Magisk module**: Copy `gsm2sip-magisk.zip` to device, install via Magisk Manager → Modules
 2. **Reboot** the device — the module installs the APK as a privileged system app and grants all permissions on boot
 3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → GSM2SIP
 4. **Configure SIP**: open Settings in the app (the gear, top right) and enter
@@ -608,11 +608,11 @@ own number, until the allowance resets.
 
 ## Magisk Module
 
-The `gateway-magisk.zip` module carries the APK and prepares the device for it:
+The `gsm2sip-magisk.zip` module carries the APK and prepares the device for it:
 
-1. **Installs the app as a privileged system app** (`system/priv-app/Gateway`)
+1. **Installs the app as a privileged system app** (`system/priv-app/GSM2SIP`)
    and grants it the telephony privileges it needs
-   (`privapp-permissions-gateway.xml`):
+   (`privapp-permissions-gsm2sip.xml`):
    - `CAPTURE_AUDIO_OUTPUT` — capture audio from other sources
    - `MODIFY_PHONE_STATE` — control telephony
    - `READ_PRIVILEGED_PHONE_STATE` — detailed call state info

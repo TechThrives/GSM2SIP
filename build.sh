@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build script for SIP-GSM Gateway APK + Magisk module.
+# Build script for GSM2SIP APK + Magisk module.
 #
 # Prerequisites:
 #   sudo ./setup.sh    # run once to install JDK, Android SDK, etc.
@@ -131,8 +131,8 @@ build_apk() {
     if [ -f "$APK_PATH" ]; then
         echo ""
         echo "APK built: $APK_PATH"
-        cp "$APK_PATH" "$SCRIPT_DIR/gateway.apk"
-        echo "Copied to: $SCRIPT_DIR/gateway.apk"
+        cp "$APK_PATH" "$SCRIPT_DIR/gsm2sip.apk"
+        echo "Copied to: $SCRIPT_DIR/gsm2sip.apk"
     else
         echo "ERROR: APK not found at $APK_PATH"
         exit 1
@@ -233,17 +233,17 @@ build_magisk() {
     # Copy the APK into the Magisk module as a system priv-app.
     # This makes the app a privileged system app, enabling permissions
     # like CAPTURE_AUDIO_OUTPUT that are required for telephony audio capture.
-    mkdir -p "$SCRIPT_DIR/magisk/system/priv-app/Gateway"
-    cp "$SCRIPT_DIR/gateway.apk" "$SCRIPT_DIR/magisk/system/priv-app/Gateway/Gateway.apk"
+    mkdir -p "$SCRIPT_DIR/magisk/system/priv-app/GSM2SIP"
+    cp "$SCRIPT_DIR/gsm2sip.apk" "$SCRIPT_DIR/magisk/system/priv-app/GSM2SIP/GSM2SIP.apk"
     echo "Included APK as priv-app in Magisk module"
 
     stamp_module_prop
 
     cd "$SCRIPT_DIR/magisk"
-    rm -f "$SCRIPT_DIR/gateway-magisk.zip"
-    zip -r "$SCRIPT_DIR/gateway-magisk.zip" . \
+    rm -f "$SCRIPT_DIR/gsm2sip-magisk.zip"
+    zip -r "$SCRIPT_DIR/gsm2sip-magisk.zip" . \
         -x "*.DS_Store" -x "__MACOSX/*"
-    echo "Magisk module: $SCRIPT_DIR/gateway-magisk.zip"
+    echo "Magisk module: $SCRIPT_DIR/gsm2sip-magisk.zip"
     cd "$SCRIPT_DIR"
 }
 
@@ -251,7 +251,7 @@ build_magisk() {
 
 install_to_device() {
     # Installing to "whatever is plugged in" is the wrong default once there is
-    # more than one phone on the bus — the gateway has been installed onto the
+    # more than one phone on the bus — GSM2SIP has been installed onto the
     # wrong handset this way.  SKIP_INSTALL=1 builds the artifacts and stops.
     if [ -n "${SKIP_INSTALL:-}" ]; then
         echo ""
@@ -267,30 +267,30 @@ install_to_device() {
     if [ "${COUNT:-0}" -gt 1 ]; then
         echo ""
         echo "$COUNT devices connected — refusing to guess which one to install to."
-        echo "Install explicitly:  adb -s <serial> install -r gateway.apk"
+        echo "Install explicitly:  adb -s <serial> install -r gsm2sip.apk"
         return 0
     fi
 
     if command -v adb &>/dev/null && adb devices 2>/dev/null | grep -q "device$"; then
         echo ""
         echo "=== Device detected — installing ==="
-        adb install -r "$SCRIPT_DIR/gateway.apk"
+        adb install -r "$SCRIPT_DIR/gsm2sip.apk"
         echo "APK installed."
         echo ""
         echo "To install Magisk module:"
-        echo "  adb push gateway-magisk.zip /sdcard/"
+        echo "  adb push gsm2sip-magisk.zip /sdcard/"
         echo "  Then install via Magisk Manager on the device."
     else
         echo ""
         echo "No ADB device connected. To install manually:"
-        echo "  adb install gateway.apk"
-        echo "  adb push gateway-magisk.zip /sdcard/"
+        echo "  adb install gsm2sip.apk"
+        echo "  adb push gsm2sip-magisk.zip /sdcard/"
     fi
 }
 
 # ── Main ─────────────────────────────────────────────
 
-echo "=== SIP-GSM Gateway Build ==="
+echo "=== GSM2SIP Build ==="
 echo ""
 
 check_java
@@ -304,11 +304,11 @@ install_to_device
 
 echo ""
 echo "=== Build complete ==="
-echo "  APK:    $SCRIPT_DIR/gateway.apk"
-echo "  Magisk: $SCRIPT_DIR/gateway-magisk.zip"
+echo "  APK:    $SCRIPT_DIR/gsm2sip.apk"
+echo "  Magisk: $SCRIPT_DIR/gsm2sip-magisk.zip"
 echo ""
 echo "Deploy to device:"
-echo "  1. adb push gateway-magisk.zip /sdcard/"
+echo "  1. adb push gsm2sip-magisk.zip /sdcard/"
 echo "     Install via Magisk Manager -> Modules, then reboot"
 echo "     (APK is included in the module as a priv-app)"
 echo "  2. After reboot: open app, grant permissions, set as default phone app"

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Setup script for building the SIP-GSM Gateway APK on Debian/Ubuntu.
+# Setup script for building the GSM-SIP Gateway APK on Debian/Ubuntu.
 # Installs JDK 17, Android SDK, build tools, and Gradle wrapper.
 #
 # Usage:
@@ -201,7 +201,7 @@ EOF
 
 echo ""
 echo "========================================="
-echo "  SIP-GSM Gateway — Build Environment"
+echo "  GSM-SIP Gateway — Build Environment"
 echo "========================================="
 echo ""
 

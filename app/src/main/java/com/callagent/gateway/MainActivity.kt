@@ -95,7 +95,7 @@ class MainActivity : AppCompatActivity() {
         // Theme.AppCompat.Empty -> DeviceDefault.Light.DarkActionBar, and
         // PhoneWindow installs a platform action bar whose inflation dies on
         // ?android:attr/colorPrimary.
-        setTheme(R.style.Theme_SipGsmGateway)
+        setTheme(R.style.Theme_GsmSipGateway)
         super.onCreate(savedInstanceState)
         onBackPressedDispatcher.addCallback(this, backCallback)
         // Portrait lock, enforced at runtime as well as in the manifest.

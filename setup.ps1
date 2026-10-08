@@ -1,5 +1,5 @@
 ﻿#
-# Setup script for building the SIP-GSM Gateway APK on Windows.
+# Setup script for building the GSM-SIP Gateway APK on Windows.
 # Checks Java, Android SDK, and ensures gradle-wrapper.jar exists.
 #
 # Usage:
@@ -133,7 +133,7 @@ function Test-GradleWrapper {
 
 Write-Host ""
 Write-Host "========================================="
-Write-Host "  SIP-GSM Gateway - Build Environment"
+Write-Host "  GSM-SIP Gateway - Build Environment"
 Write-Host "  (Windows)"
 Write-Host "========================================="
 Write-Host ""

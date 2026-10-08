@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SipGsmGateway"
+rootProject.name = "GsmSipGateway"
 include(":app")

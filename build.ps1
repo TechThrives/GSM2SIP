@@ -1,5 +1,5 @@
 ﻿#
-# Build script for SIP-GSM Gateway APK + Magisk module (Windows PowerShell).
+# Build script for GSM2SIP APK + Magisk module (Windows PowerShell).
 #
 # Prerequisites:
 #   .\setup.ps1    # run once to install Android SDK, etc.
@@ -162,8 +162,8 @@ function Build-Apk {
     if (Test-Path $apkPath) {
         Write-Host ""
         Write-Host "APK built: $apkPath"
-        Copy-Item $apkPath (Join-Path $ScriptDir "gateway.apk") -Force
-        Write-Host "Copied to: $(Join-Path $ScriptDir 'gateway.apk')"
+        Copy-Item $apkPath (Join-Path $ScriptDir "gsm2sip.apk") -Force
+        Write-Host "Copied to: $(Join-Path $ScriptDir 'gsm2sip.apk')"
     } else {
         Write-Error "APK not found at $apkPath"
         exit 1
@@ -270,14 +270,14 @@ function Build-Magisk {
     Build-Tinymix
 
     # Copy the APK into the Magisk module as a system priv-app
-    $privAppDir = Join-Path $ScriptDir "magisk\system\priv-app\Gateway"
+    $privAppDir = Join-Path $ScriptDir "magisk\system\priv-app\GSM2SIP"
     New-Item -ItemType Directory -Path $privAppDir -Force | Out-Null
-    Copy-Item (Join-Path $ScriptDir "gateway.apk") (Join-Path $privAppDir "Gateway.apk") -Force
+    Copy-Item (Join-Path $ScriptDir "gsm2sip.apk") (Join-Path $privAppDir "GSM2SIP.apk") -Force
     Write-Host "Included APK as priv-app in Magisk module"
 
     Stamp-ModuleProp
 
-    $zipPath = Join-Path $ScriptDir "gateway-magisk.zip"
+    $zipPath = Join-Path $ScriptDir "gsm2sip-magisk.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
     # Ensure all shell scripts have Unix line endings (LF) and no BOM before zipping
@@ -328,7 +328,7 @@ function Install-ToDevice {
     if ($devices.Count -gt 1) {
         Write-Host ""
         Write-Host "$($devices.Count) devices connected - refusing to guess which one to install to."
-        Write-Host 'Install explicitly:  adb -s <serial> install -r gateway.apk'
+        Write-Host 'Install explicitly:  adb -s <serial> install -r gsm2sip.apk'
         return
     }
 
@@ -338,24 +338,24 @@ function Install-ToDevice {
         if ($deviceList) {
             Write-Host ""
             Write-Host "=== Device detected - installing ==="
-            & adb install -r (Join-Path $ScriptDir "gateway.apk")
+            & adb install -r (Join-Path $ScriptDir "gsm2sip.apk")
             Write-Host "APK installed."
             Write-Host ""
             Write-Host "To install Magisk module:"
-            Write-Host "  adb push gateway-magisk.zip /sdcard/"
+            Write-Host "  adb push gsm2sip-magisk.zip /sdcard/"
             Write-Host "  Then install via Magisk Manager on the device."
         } else {
             Write-Host ""
             Write-Host "No ADB device connected. To install manually:"
-            Write-Host "  adb install gateway.apk"
-            Write-Host "  adb push gateway-magisk.zip /sdcard/"
+            Write-Host "  adb install gsm2sip.apk"
+            Write-Host "  adb push gsm2sip-magisk.zip /sdcard/"
         }
     }
 }
 
 # ── Main ─────────────────────────────────────────────
 
-Write-Host "=== SIP-GSM Gateway Build ==="
+Write-Host "=== GSM2SIP Build ==="
 Write-Host ""
 
 Test-Java
@@ -369,11 +369,11 @@ Install-ToDevice
 
 Write-Host ""
 Write-Host "=== Build complete ==="
-Write-Host "  APK:    $(Join-Path $ScriptDir 'gateway.apk')"
-Write-Host "  Magisk: $(Join-Path $ScriptDir 'gateway-magisk.zip')"
+Write-Host "  APK:    $(Join-Path $ScriptDir 'gsm2sip.apk')"
+Write-Host "  Magisk: $(Join-Path $ScriptDir 'gsm2sip-magisk.zip')"
 Write-Host ""
 Write-Host "Deploy to device:"
-Write-Host "  1. adb push gateway-magisk.zip /sdcard/"
+Write-Host "  1. adb push gsm2sip-magisk.zip /sdcard/"
 Write-Host "     Install via Magisk Manager -> Modules, then reboot"
 Write-Host "     (APK is included in the module as a priv-app)"
 Write-Host "  2. After reboot: open app, grant permissions, set as default phone app"

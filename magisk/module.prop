@@ -1,5 +1,5 @@
-id=sip-gsm-gateway
-name=GSM2SIP Gateway
+id=gsm2sip
+name=GSM2SIP
 version=v1.2.0
 versionCode=425
 author=callagent

@@ -9,13 +9,13 @@
 # Also logs CAPTURE_AUDIO_OUTPUT grant status for debugging.
 
 MODDIR="${0%/*}"
-TAG="GatewayMagisk"
+TAG="GSM2SIPMagisk"
 
 MOD_VER=$(grep '^version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2)
-log -t "$TAG" "SIP-GSM Gateway Magisk Module ${MOD_VER:-unknown} — service.sh running"
+log -t "$TAG" "GSM2SIP Magisk Module ${MOD_VER:-unknown} — service.sh running"
 
-PRIV_DIR="$MODDIR/system/priv-app/Gateway"
-PRIV_APK="$PRIV_DIR/Gateway.apk"
+PRIV_DIR="$MODDIR/system/priv-app/GSM2SIP"
+PRIV_APK="$PRIV_DIR/GSM2SIP.apk"
 
 # ── Sync APK ──────────────────────────────────────────
 # pm path returns the currently-active APK (may be /data/app/ update)
@@ -37,7 +37,7 @@ if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
         log -t "$TAG" "Priv-app APK is up to date"
     fi
 else
-    log -t "$TAG" "Gateway app not installed — nothing to sync"
+    log -t "$TAG" "GSM2SIP app not installed — nothing to sync"
 fi
 
 # ── Wait for PackageManager ───────────────────────────
@@ -59,18 +59,18 @@ wait_for_pm() {
 }
 
 # ── Keep the app's Magisk su policy on "allow" ────────
-# The gateway is useless without root: it drives the ALSA mixer through
+# The GSM2SIP app is useless without root: it drives the ALSA mixer through
 # tinymix to route agent audio into the GSM uplink, and grants itself
 # RECORD_AUDIO via appops.  Denied, it still answers calls and bridges them
 # with no audio in either direction, which is a much worse failure than not
 # answering at all.
 #
 # A superuser prompt that nobody is there to answer — this is a headless
-# gateway — writes policy=1 (deny) permanently, and that is exactly how a
+# GSM2SIP — writes policy=1 (deny) permanently, and that is exactly how a
 # working device went silent on 2026-09-09.  Seed policy=2 (allow) on every
 # boot so a stray prompt or a reinstall cannot leave it denied.
 #
-# Note this deliberately overrides a manual deny: on a dedicated gateway that
+# Note this deliberately overrides a manual deny: on a dedicated GSM2SIP unit that
 # is the intent.  Remove this module to take the grant away.
 seed_su_policy() {
     # The uid is assigned when the app is installed, so it cannot be baked in
@@ -99,13 +99,13 @@ seed_su_policy() {
     if magisk --sqlite "SELECT policy FROM policies WHERE uid=$SU_UID" 2>/dev/null | grep -q "policy=2"; then
         log -t "$TAG" "su policy: uid $SU_UID allowed"
     else
-        log -t "$TAG" "su policy: FAILED to allow uid $SU_UID — gateway will bridge calls with no audio"
+        log -t "$TAG" "su policy: FAILED to allow uid $SU_UID — GSM2SIP will bridge calls with no audio"
     fi
 }
 
 # ── Grant runtime permissions automatically ───────────
 # These normally require user approval via UI prompts.
-# Granting them here avoids manual setup on a headless gateway.
+# Granting them here avoids manual setup on a headless GSM2SIP unit.
 PKG="com.callagent.gateway"
 (
 wait_for_pm
@@ -131,7 +131,7 @@ done
 # ── No outgoing SMS rate limit ────────────────────────
 # SmsUsageMonitor stops an app that is not the default SMS app after 30
 # messages in 30 minutes and asks the user to confirm — a dialog nobody is
-# there to answer on a gateway.  It reads these two globals before falling
+# there to answer on GSM2SIP.  It reads these two globals before falling
 # back to the framework defaults, so setting them lifts the cap.
 settings put global sms_outgoing_check_interval_ms 1000 2>/dev/null && \
     log -t "$TAG" "Outgoing SMS rate limit lifted" || \
@@ -139,7 +139,7 @@ settings put global sms_outgoing_check_interval_ms 1000 2>/dev/null && \
 settings put global sms_outgoing_check_max_count 1000000 2>/dev/null
 
 # ── Keep SMS traffic silent ───────────────────────────
-# The gateway forwards messages; it does not need the device to announce them,
+# The GSM2SIP app forwards messages; it does not need the device to announce them,
 # and nobody is looking at this screen.  The default SMS app stays what it is -
 # it stores the messages and its copy is a useful independent record - but it
 # is not allowed to notify.

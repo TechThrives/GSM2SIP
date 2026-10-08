@@ -1,7 +1,7 @@
 # Build outputs
 *.apk
-gateway-magisk.zip
-magisk/system/priv-app/Gateway/
+gsm2sip-magisk.zip
+magisk/system/priv-app/GSM2SIP/
 !magisk/system/priv-app/PermissionController/
 local.properties
 .env.build

@@ -127,14 +127,10 @@ class ConfigController(
         syncSrtpEnabled()
         cbTls.setOnCheckedChangeListener { _, checked ->
             syncSrtpEnabled()
-            val port = activity.findViewById<EditText>(R.id.etCfgPort)
-            val current = port.text.toString().trim().toIntOrNull()
-            if (checked && current == 5060) {
-                port.setText("5061")
-                Toast.makeText(activity, "Port switched to 5061 for TLS", Toast.LENGTH_SHORT).show()
-            } else if (!checked && current == 5061) {
-                port.setText("5060")
-                Toast.makeText(activity, "Port switched back to 5060", Toast.LENGTH_SHORT).show()
+            if (checked) {
+                Toast.makeText(activity, "TLS enabled", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(activity, "TLS disabled", Toast.LENGTH_SHORT).show()
             }
         }
         activity.findViewById<RadioButton>(
